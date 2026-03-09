@@ -1,0 +1,22 @@
+[package]
+name                 = "xiaoyong-channels"
+description          = "Collection of channel primitives for sync and async contexts (both Sync and !Sync)"
+version              = "1.0.0"
+publish.workspace    = true
+authors.workspace    = true
+repository.workspace = true
+edition.workspace    = true
+license.workspace    = true
+categories           = [ "asynchronous", "data-structures", "rust-patterns" ]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[dependencies]
+triomphe.workspace        = true
+futures.workspace         = true
+crossbeam-utils.workspace = true
+smallvec.workspace        = true
