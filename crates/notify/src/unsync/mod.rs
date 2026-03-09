@@ -1,3 +1,5 @@
+//! `!Sync` implementations.
+
 pub mod oneshot;
 pub mod queued;
 pub mod reusable;
