@@ -22,3 +22,5 @@ However, their lock guards (e.g., `MutexGuard`) are explicitly `!Send`. This gua
 * `unsync::async_rwlock::RwLock`: An asynchronous, single-threaded Reader-Writer Lock.
 * `unsync::async_rcswap::RcSwap`: An asynchronous primitive for atomic swapping of `Rc` pointers.
 * `unsync::rcswap::RcSwap`: A synchronous primitive for atomic swapping of `Rc` pointers.
+* `sync::atomic_once::AtomicOnce`: A lightweight, lock-free alternative to `std::sync::OnceLock`.
+* `sync::permanent::Permanent`: Handle to a statically allocated data.
