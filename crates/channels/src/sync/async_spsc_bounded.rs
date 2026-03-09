@@ -1,4 +1,4 @@
-//! A thread-safe, bounded, single-producer single-consumer (SPSC) channel.
+//! Thread-safe, bounded, single-producer single-consumer (SPSC) channel.
 
 use std::{
     cell::UnsafeCell,

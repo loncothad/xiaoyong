@@ -1,4 +1,4 @@
-//! A single-threaded, one-time notification primitive.
+//! Single-threaded, one-time notification primitive.
 
 use std::{
     cell::Cell,
@@ -13,7 +13,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-/// A single-threaded, one-time notification primitive.
+/// Single-threaded, one-time notification primitive.
 ///
 /// **Thread Safety:** This type is designed for single-threaded executors and
 /// is !Send.

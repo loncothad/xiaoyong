@@ -1,4 +1,4 @@
-//! A single-threaded, asynchronous primitive for atomic swapping of Rc
+//! Single-threaded, asynchronous primitive for atomic swapping of Rc
 //! pointers.
 
 use std::{
@@ -23,7 +23,7 @@ struct Inner<T> {
     wakers:  SmallVec<[Waker; 8]>,
 }
 
-/// An asynchronous primitive for atomic swapping of Rc pointers.
+/// Asynchronous primitive for atomic swapping of Rc pointers.
 ///
 /// **Thread Safety:** This type utilizes Rc and is strictly !Send.
 pub struct RcSwap<T> {

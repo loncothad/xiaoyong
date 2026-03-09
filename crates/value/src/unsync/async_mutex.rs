@@ -1,4 +1,4 @@
-//! A single-threaded, asynchronous mutual exclusion lock.
+//! Single-threaded, asynchronous mutual exclusion lock.
 
 use std::{
     cell::{
@@ -19,7 +19,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-/// An asynchronous, single-threaded Mutex.
+/// Asynchronous, single-threaded Mutex.
 ///
 /// **Thread Safety:** This Mutex is built on Cell and UnsafeCell and does not
 /// use Rc. It automatically implements Send if T: Send, so it can be moved

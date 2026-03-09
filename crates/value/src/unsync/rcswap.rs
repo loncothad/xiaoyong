@@ -1,4 +1,4 @@
-//! A single-threaded, synchronous primitive for atomic swapping of Rc pointers.
+//! Single-threaded, synchronous primitive for atomic swapping of Rc pointers.
 
 use std::{
     cell::UnsafeCell,
@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-/// A synchronous primitive for atomic swapping of Rc pointers.
+/// Synchronous primitive for atomic swapping of Rc pointers.
 ///
 /// **Thread Safety:** This type utilizes Rc and is strictly !Send.
 pub struct RcSwap<T> {

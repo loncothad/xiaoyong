@@ -1,4 +1,4 @@
-//! A single-threaded, single-use channel for transferring a single value.
+//! Single-threaded, single-use channel for transferring a single value.
 
 use std::{
     cell::UnsafeCell,
@@ -34,8 +34,8 @@ enum State<T> {
     Canceled,
 }
 
-#[derive(Debug, PartialEq, Eq)]
 /// Error returned when attempting to receive a value outside an async context.
+#[derive(Debug, PartialEq, Eq)]
 pub enum TryRecvError {
     /// The channel is still open, but no value has been sent yet.
     Empty,

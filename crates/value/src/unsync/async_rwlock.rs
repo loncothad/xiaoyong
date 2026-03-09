@@ -29,7 +29,7 @@ enum WaiterType {
     Write,
 }
 
-/// An asynchronous, single-threaded Reader-Writer Lock.
+/// Asynchronous, single-threaded Reader-Writer Lock.
 ///
 /// **Thread Safety:** This lock is built on Cell and UnsafeCell and does not
 /// use Rc. It automatically implements Send if T: Send, so it can be moved

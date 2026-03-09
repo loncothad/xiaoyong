@@ -1,10 +1,10 @@
 # xiaoyong-value
 
-Asynchronous synchronization primitives for sharing state.
+Shared state primitives for sharing state.
 
 ## Overview
 
-This crate provides synchronization primitives like `Mutex` and `RwLock`.
+This crate provides shared state primitives like `Mutex` and `RwLock`.
 
 The `unsync` module provides primitives tailored for single-threaded executors (like `tokio::task::LocalSet`).
 

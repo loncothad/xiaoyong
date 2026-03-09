@@ -7,8 +7,9 @@ use std::{
 };
 
 /// Handle that mimics a `'static` reference.
-/// 
-/// **Thread Safety:** Can be used anywhere and does not produce any form of overhead.
+///
+/// **Thread Safety:** Can be used anywhere and does not produce any form of
+/// overhead.
 pub struct Permanent<T: 'static> {
     inner: &'static T,
 }

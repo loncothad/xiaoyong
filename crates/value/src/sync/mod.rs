@@ -1,4 +1,4 @@
-//! Thread-safe synchronization primitives.
+//! Thread-safe shared state primitives.
 
 // TODO: ArcSwap (sync and async) implementation
 pub mod atomic_once;

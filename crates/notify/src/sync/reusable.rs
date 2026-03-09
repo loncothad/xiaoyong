@@ -1,4 +1,4 @@
-//! A thread-safe, reusable notification primitive.
+//! Thread-safe, reusable notification primitive.
 
 use std::{
     future::Future,
@@ -20,7 +20,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-/// A thread-safe, reusable notification primitive.
+/// Thread-safe, reusable notification primitive.
 pub struct Notify {
     generation: AtomicUsize,
     permit:     AtomicBool,

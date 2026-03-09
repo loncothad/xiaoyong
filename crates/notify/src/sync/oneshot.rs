@@ -1,4 +1,4 @@
-//! A thread-safe, one-time notification primitive.
+//! Thread-safe, one-time notification primitive.
 
 use std::{
     future::Future,
@@ -19,7 +19,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-/// A thread-safe, one-time notification primitive.
+/// Thread-safe, one-time notification primitive.
 pub struct Notify {
     fired:   AtomicBool,
     waiters: Mutex<SmallVec<[Option<Waker>; 8]>>,

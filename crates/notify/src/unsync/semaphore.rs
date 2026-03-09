@@ -1,4 +1,4 @@
-//! A single-threaded asynchronous semaphore for limiting concurrent access.
+//! Single-threaded asynchronous semaphore for limiting concurrent access.
 
 use std::{
     cell::UnsafeCell,
@@ -18,7 +18,7 @@ struct Inner {
     wakers:  SmallVec<[Waker; 8]>,
 }
 
-/// A single-threaded asynchronous semaphore.
+/// Single-threaded asynchronous semaphore.
 ///
 /// **Thread Safety:** This type is designed for single-threaded executors and
 /// is !Send.

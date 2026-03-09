@@ -1,4 +1,4 @@
-//! A single-threaded, bounded, multi-producer single-consumer (MPSC) channel.
+//! Single-threaded, bounded, multi-producer single-consumer (MPSC) channel.
 
 use std::{
     cell::Cell,
@@ -52,7 +52,7 @@ struct Shared<T> {
     closed:       Cell<bool>,
 }
 
-/// A single-threaded sender for the MPSC channel.
+/// Single-threaded sender for the MPSC channel.
 ///
 /// **Thread Safety:** This type uses Rc internally and is explicitly !Send.
 /// It is designed for use within single-threaded async environments.
@@ -60,7 +60,7 @@ pub struct Sender<T> {
     shared: Rc<Shared<T>>,
 }
 
-/// A single-threaded receiver for the MPSC channel.
+/// Single-threaded receiver for the MPSC channel.
 ///
 /// **Thread Safety:** This type uses Rc internally and is explicitly !Send.
 pub struct Receiver<T> {

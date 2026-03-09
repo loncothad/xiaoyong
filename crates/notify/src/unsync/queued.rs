@@ -1,4 +1,4 @@
-//! A single-threaded notification primitive supporting queuing.
+//! Single-threaded notification primitive supporting queuing.
 
 use std::{
     cell::Cell,
@@ -13,7 +13,7 @@ use std::{
 
 use smallvec::SmallVec;
 
-/// A single-threaded notification primitive supporting queuing.
+/// Single-threaded notification primitive supporting queuing.
 ///
 /// **Thread Safety:** This type is designed for single-threaded executors and
 /// is !Send.
