@@ -66,11 +66,11 @@ impl<T> AtomicOnce<T> {
 
     /// Attempts to initialize the cell with the provided value.
     ///
-    /// Returns `Ok(())` on success. If the cell was already initialized or or
-    /// we lost the atomic CAS race, it returns `Err(val)`.
-    pub fn init(&self, val: Box<T>) -> Result<(), Box<T>> {
-        if !self.ptr.load(Ordering::Acquire).is_null() {
-            return Err(val);
+    /// If the cell was already initialized or we lost the CAS race, returns
+    /// the reference to the initialized value and the owned value `val`.
+    pub fn init(&self, val: Box<T>) -> Result<(), (&T, Box<T>)> {
+        if let Some(existing) = self.get() {
+            return Err((existing, val));
         }
 
         let val_ptr = Box::into_raw(val);
@@ -80,12 +80,16 @@ impl<T> AtomicOnce<T> {
             .compare_exchange(ptr::null_mut(), val_ptr, Ordering::Release, Ordering::Acquire)
         {
             | Ok(_) => Ok(()),
-            | Err(_) => {
+            | Err(existing_ptr) => {
                 // SAFETY: We just created this raw pointer from a Box. Since we lost
                 // the CAS race, we still have exclusive ownership over this specific
                 // allocation.
-                let unneeded_box = unsafe { Box::from_raw(val_ptr) };
-                Err(unneeded_box)
+                let this_candidate = unsafe { Box::from_raw(val_ptr) };
+
+                // SAFETY: `existing_ptr` was successfully written by the winning thread.
+                let existing = unsafe { &*existing_ptr };
+
+                Err((existing, this_candidate))
             },
         }
     }
