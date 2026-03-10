@@ -68,7 +68,7 @@ impl<T> AtomicOnce<T> {
     ///
     /// Returns `Ok(())` on success. If the cell was already initialized or or
     /// we lost the atomic CAS race, it returns `Err(val)`.
-    pub unsafe fn init(&self, val: Box<T>) -> Result<(), Box<T>> {
+    pub fn init(&self, val: Box<T>) -> Result<(), Box<T>> {
         if !self.ptr.load(Ordering::Acquire).is_null() {
             return Err(val);
         }
