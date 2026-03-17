@@ -64,6 +64,12 @@ impl<T> AtomicOnce<T> {
         }
     }
 
+    pub unsafe fn get_unchecked(&self) -> &T {
+        unsafe {
+            &**self.ptr.as_ptr()
+        }
+    }
+
     /// Attempts to initialize the cell with the provided value.
     ///
     /// If the cell was already initialized or we lost the CAS race, returns
