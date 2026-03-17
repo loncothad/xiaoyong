@@ -44,6 +44,11 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
+    /// Get a raw pointer to the underlying data.
+    pub fn value_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+    
     /// Acquire the lock.
     pub async fn lock(&self) -> MutexGuard<'_, T> {
         LockFuture {

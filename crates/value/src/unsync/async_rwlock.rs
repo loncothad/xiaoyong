@@ -55,6 +55,11 @@ impl<T> RwLock<T> {
 }
 
 impl<T: ?Sized> RwLock<T> {
+    /// Get a raw pointer to the underlying data.
+    pub fn value_ptr(&self) -> *mut T {
+        self.value.get()
+    }
+    
     /// Acquires the lock for reading asynchronously.
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
         RwLockReadFuture {
