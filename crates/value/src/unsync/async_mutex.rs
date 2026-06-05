@@ -1,6 +1,6 @@
 //! Single-threaded, asynchronous mutual exclusion lock.
 
-use std::{
+use core::{
     cell::{
         Cell,
         UnsafeCell,
@@ -48,7 +48,7 @@ impl<T: ?Sized> Mutex<T> {
     pub fn value_ptr(&self) -> *mut T {
         self.value.get()
     }
-    
+
     /// Acquire the lock.
     pub async fn lock(&self) -> MutexGuard<'_, T> {
         LockFuture {

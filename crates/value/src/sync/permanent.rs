@@ -1,6 +1,6 @@
 //! Handle to a statically allocated data.
 
-use std::{
+use core::{
     fmt,
     mem,
     ops::Deref,

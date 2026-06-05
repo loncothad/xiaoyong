@@ -1,6 +1,6 @@
 //! A single-threaded, asynchronous reader-writer lock.
 
-use std::{
+use core::{
     cell::{
         Cell,
         UnsafeCell,
@@ -59,7 +59,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn value_ptr(&self) -> *mut T {
         self.value.get()
     }
-    
+
     /// Acquires the lock for reading asynchronously.
     pub async fn read(&self) -> RwLockReadGuard<'_, T> {
         RwLockReadFuture {

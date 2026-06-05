@@ -1,5 +1,5 @@
 //! `Sync`-friendly implementations.
 
-// TODO: ArcSwap (sync and async) implementation
+pub mod async_arcswap;
 pub mod atomic_once;
 pub mod permanent;

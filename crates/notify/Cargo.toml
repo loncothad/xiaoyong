@@ -12,6 +12,11 @@ categories           = [ "asynchronous", "data-structures", "rust-patterns" ]
 [lints]
 workspace = true
 
+[features]
+alloc   = [  ]
+default = [ "std" ]
+std     = [ "alloc" ]
+
 [dev-dependencies]
 tokio.workspace = true
 

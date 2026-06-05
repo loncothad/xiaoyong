@@ -233,6 +233,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "xiaoyong-collections"
+version = "0.1.0"
+
+[[package]]
 name = "xiaoyong-notify"
 version = "1.0.0"
 dependencies = [

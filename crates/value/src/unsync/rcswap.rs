@@ -1,11 +1,11 @@
 //! Single-threaded, synchronous primitive for atomic swapping of Rc pointers.
 
-use std::{
+use core::{
     cell::UnsafeCell,
     mem,
     ptr,
-    rc::Rc,
 };
+use std::rc::Rc;
 
 /// Synchronous primitive for atomic swapping of Rc pointers.
 ///

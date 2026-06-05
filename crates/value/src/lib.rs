@@ -4,5 +4,8 @@
 //! implementations. The `unsync` types are optimized for environments where
 //! tasks remain on a single thread.
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub mod sync;
 pub mod unsync;

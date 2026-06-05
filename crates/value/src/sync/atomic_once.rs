@@ -1,11 +1,9 @@
 //! Lightweight, lock-free alternative to `std::sync::OnceLock`.
 
-use std::{
-    ptr,
-    sync::atomic::{
-        AtomicPtr,
-        Ordering,
-    },
+use core::ptr;
+use std::sync::atomic::{
+    AtomicPtr,
+    Ordering,
 };
 
 /// Lock-free, single-assignment cell.
@@ -65,9 +63,7 @@ impl<T> AtomicOnce<T> {
     }
 
     pub unsafe fn get_unchecked(&self) -> &T {
-        unsafe {
-            &**self.ptr.as_ptr()
-        }
+        unsafe { &**self.ptr.as_ptr() }
     }
 
     /// Attempts to initialize the cell with the provided value.
