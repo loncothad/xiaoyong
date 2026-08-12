@@ -79,7 +79,10 @@ impl<T: ?Sized> RwLock<T> {
     /// Attempts to acquire the lock for reading without blocking.
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         let s = self.state.get();
-        if s != WRITE_LOCKED {
+        let queue = self.waiters.take();
+        let writer_is_waiting = queue.iter().any(|(_, kind, _)| *kind == WaiterType::Write);
+        self.waiters.set(queue);
+        if s != WRITE_LOCKED && !writer_is_waiting {
             self.state.set(s + 1);
             Some(RwLockReadGuard {
                 lock: self
@@ -182,7 +185,7 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let mut queue = self.lock.waiters.take();
-            let was_first = queue.first().map_or(false, |(i, ..)| *i == id);
+            let was_first = queue.first().is_some_and(|(i, ..)| *i == id);
             queue.retain(|(i, ..)| *i != id);
             self.lock.waiters.set(queue);
 
@@ -214,7 +217,7 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
         });
 
         let mut queue = self.lock.waiters.take();
-        let is_first = queue.first().map_or(true, |(i, ..)| *i == id);
+        let is_first = queue.first().is_none_or(|(i, ..)| *i == id);
 
         if s == UNLOCKED && is_first {
             self.lock.state.set(WRITE_LOCKED);
@@ -246,7 +249,7 @@ impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let mut queue = self.lock.waiters.take();
-            let was_first = queue.first().map_or(false, |(i, ..)| *i == id);
+            let was_first = queue.first().is_some_and(|(i, ..)| *i == id);
             queue.retain(|(i, ..)| *i != id);
             self.lock.waiters.set(queue);
 
@@ -266,6 +269,8 @@ impl<'a, T: ?Sized> Deref for RwLockReadGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: a read guard proves that no writer exists, and the lock is
+        // single-threaded so concurrent access cannot occur on another thread.
         unsafe { &*self.lock.value.get() }
     }
 }
@@ -290,12 +295,14 @@ impl<'a, T: ?Sized> Deref for RwLockWriteGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: the write guard has exclusive access to the protected value.
         unsafe { &*self.lock.value.get() }
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for RwLockWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the write guard has exclusive access to the protected value.
         unsafe { &mut *self.lock.value.get() }
     }
 }
@@ -311,21 +318,26 @@ impl<'a, T: ?Sized> Drop for RwLockWriteGuard<'a, T> {
 mod tests {
     use std::rc::Rc;
 
+    use tokio::task;
+
     use super::*;
 
     #[tokio::test]
     async fn async_rwlock() {
-        let rwlock = Rc::new(RwLock::new(0));
+        let local = task::LocalSet::new();
+        local
+            .run_until(async move {
+                let rwlock = Rc::new(RwLock::new(0));
+                let writer = Rc::clone(&rwlock);
+                let task = task::spawn_local(async move {
+                    let mut guard = writer.write().await;
+                    *guard = 42;
+                });
+                assert!(task.await.is_ok());
 
-        let r1 = Rc::clone(&rwlock);
-        tokio::task::spawn_local(async move {
-            let mut guard = r1.write().await;
-            *guard = 42;
-        })
-        .await
-        .unwrap();
-
-        let guard = rwlock.read().await;
-        assert_eq!(*guard, 42);
+                let guard = rwlock.read().await;
+                assert_eq!(*guard, 42);
+            })
+            .await;
     }
 }

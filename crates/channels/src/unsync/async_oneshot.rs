@@ -119,6 +119,8 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let state_ptr = self.inner.get();
 
+        // SAFETY: the channel is single-threaded. The state is replaced before
+        // invoking the extracted waker, preventing aliased re-entrant access.
         let waker = unsafe {
             let state = &mut *state_ptr;
             if matches!(state, State::Incomplete { .. }) {
@@ -151,7 +153,8 @@ impl<T> Future for Receiver<T> {
 
         let old_waker: Option<Waker>;
 
-        // Inspect state and extract waker if incomplete.
+        // SAFETY: the channel is single-threaded. No external code runs while
+        // the state is mutably inspected or replaced.
         unsafe {
             let state = &mut *state_ptr;
             match state {
@@ -180,7 +183,8 @@ impl<T> Future for Receiver<T> {
             | _ => new_waker.clone(),
         };
 
-        // Put the waker back if the state is still Incomplete.
+        // SAFETY: the channel is single-threaded, and the prior mutable borrow
+        // ended before `will_wake` or cloning could invoke external behavior.
         unsafe {
             let state = &mut *state_ptr;
             if let State::Incomplete {

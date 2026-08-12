@@ -1,4 +1,4 @@
-//! `Sync`-friendly implementations.
+//! Thread-safe channel primitives.
 
 pub mod async_mpmc_bounded;
 pub mod async_oneshot;

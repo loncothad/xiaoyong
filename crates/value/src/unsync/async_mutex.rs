@@ -60,7 +60,10 @@ impl<T: ?Sized> Mutex<T> {
 
     /// Try to acquire the lock without blocking.
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        if !self.is_locked.get() {
+        let queue = self.waiters.take();
+        let has_waiters = !queue.is_empty();
+        self.waiters.set(queue);
+        if !self.is_locked.get() && !has_waiters {
             self.is_locked.set(true);
             Some(MutexGuard {
                 mutex: self
@@ -81,18 +84,23 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
     type Output = MutexGuard<'a, T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.mutex.is_locked.get() {
+        let mut queue = self.mutex.waiters.take();
+        let is_next = match self.id {
+            | Some(id) => queue.first().is_some_and(|(waiter_id, _)| *waiter_id == id),
+            | None => queue.is_empty(),
+        };
+
+        if !self.mutex.is_locked.get() && is_next {
             self.mutex.is_locked.set(true);
 
             // Success: Clean up our queue entry if we were previously pending
             if let Some(id) = self.id {
-                let mut queue = self.mutex.waiters.take();
                 queue.retain(|(w_id, _)| *w_id != id);
-                self.mutex.waiters.set(queue);
 
                 // Disable the Drop handler since we successfully acquired the lock
                 self.id = None;
             }
+            self.mutex.waiters.set(queue);
 
             Poll::Ready(MutexGuard {
                 mutex: self.mutex
@@ -105,8 +113,6 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
                 self.id = Some(new_id);
                 new_id
             });
-
-            let mut queue = self.mutex.waiters.take();
 
             // Update the waker if we're already in the queue, else push
             match queue.iter_mut().find(|(i, _)| *i == id) {
@@ -155,12 +161,14 @@ impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
+        // SAFETY: the guard is only created after acquiring exclusive access.
         unsafe { &*self.mutex.value.get() }
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the guard is only created after acquiring exclusive access.
         unsafe { &mut *self.mutex.value.get() }
     }
 }
@@ -198,7 +206,6 @@ mod tests {
                 task::spawn_local(async move {
                     let mut guard = m1.lock().await;
                     *guard += 1;
-                    ()
                 })
                 .await
                 .unwrap();

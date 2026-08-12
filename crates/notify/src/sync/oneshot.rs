@@ -37,11 +37,12 @@ impl Notify {
     /// Fires the notification, waking up waiting tasks.
     pub fn fire(&self) {
         if !self.fired.swap(true, Ordering::Release) {
-            let mut waiters = self.waiters.lock().unwrap();
-            for waker in waiters.drain(..) {
-                if let Some(w) = waker {
-                    w.wake();
-                }
+            let wakers = {
+                let mut waiters = self.waiters.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                waiters.drain(..).flatten().collect::<SmallVec<[_; 8]>>()
+            };
+            for waker in wakers {
+                waker.wake();
             }
         }
     }
@@ -75,7 +76,11 @@ impl<'a> Future for WaitFuture<'a> {
             return Poll::Ready(());
         }
 
-        let mut waiters = self.notify.waiters.lock().unwrap();
+        let mut waiters = self
+            .notify
+            .waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Double check after lock
         if self.notify.fired.load(Ordering::Acquire) {
@@ -101,7 +106,11 @@ impl<'a> Drop for WaitFuture<'a> {
     fn drop(&mut self) {
         if let Some(idx) = self.index {
             if !self.notify.fired.load(Ordering::Acquire) {
-                let mut waiters = self.notify.waiters.lock().unwrap();
+                let mut waiters = self
+                    .notify
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if idx < waiters.len() {
                     waiters[idx] = None;
                 }

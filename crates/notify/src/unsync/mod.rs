@@ -1,4 +1,4 @@
-//! `!Sync` implementations.
+//! Single-threaded notification primitives.
 
 pub mod oneshot;
 pub mod queued;

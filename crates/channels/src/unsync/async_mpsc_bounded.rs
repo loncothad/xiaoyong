@@ -44,12 +44,13 @@ pub enum TryPopError {
 }
 
 struct Shared<T> {
-    queue:        Cell<Option<SmallVec<[T; 32]>>>,
-    capacity:     usize,
-    rx_waker:     Cell<Option<Waker>>,
-    tx_wakers:    Cell<Vec<Waker>>,
-    sender_count: Cell<usize>,
-    closed:       Cell<bool>,
+    queue:          Cell<Option<SmallVec<[T; 32]>>>,
+    capacity:       usize,
+    rx_waker:       Cell<Option<Waker>>,
+    tx_wakers:      Cell<Vec<(usize, Waker)>>,
+    next_waiter_id: Cell<usize>,
+    sender_count:   Cell<usize>,
+    closed:         Cell<bool>,
 }
 
 /// Single-threaded sender for the MPSC channel.
@@ -75,6 +76,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         capacity,
         rx_waker: Cell::new(None),
         tx_wakers: Cell::new(Vec::new()),
+        next_waiter_id: Cell::new(0),
         sender_count: Cell::new(1),
         closed: Cell::new(false),
     });
@@ -119,6 +121,7 @@ impl<T> Sender<T> {
     /// Push a value into the channel.
     pub async fn push(&self, value: T) -> Result<(), PushError<T>> {
         let mut val_opt = Some(value);
+        let mut registration = SenderRegistration::new(&self.shared);
         poll_fn(|cx| {
             let v = val_opt.take().unwrap();
             match self.try_push(v) {
@@ -128,9 +131,7 @@ impl<T> Sender<T> {
                     val_opt = Some(v); // Put the value back for the next poll
 
                     // Register the sender's waker to be notified on the next pop
-                    let mut wakers = self.shared.tx_wakers.take();
-                    wakers.push(cx.waker().clone());
-                    self.shared.tx_wakers.set(wakers);
+                    registration.register(cx.waker());
 
                     Poll::Pending
                 },
@@ -193,20 +194,64 @@ impl<T> Sender<T> {
             return Ok(());
         }
 
+        let mut registration = SenderRegistration::new(&self.shared);
         poll_fn(|cx| {
             match self.try_push_many(std::mem::take(&mut remainder)) {
                 | Ok(()) => Poll::Ready(Ok(())),
                 | Err(TryPushManyError::Closed(rem)) => Poll::Ready(Err(PushManyError(rem))),
                 | Err(TryPushManyError::Full(rem)) => {
                     remainder = rem;
-                    let mut wakers = self.shared.tx_wakers.take();
-                    wakers.push(cx.waker().clone());
-                    self.shared.tx_wakers.set(wakers);
+                    registration.register(cx.waker());
                     Poll::Pending
                 },
             }
         })
         .await
+    }
+}
+
+struct SenderRegistration<'a, T> {
+    shared: &'a Shared<T>,
+    id:     Option<usize>,
+}
+
+impl<'a, T> SenderRegistration<'a, T> {
+    fn new(shared: &'a Shared<T>) -> Self {
+        Self {
+            shared,
+            id: None,
+        }
+    }
+
+    fn register(&mut self, waker: &Waker) {
+        let mut waiters = self.shared.tx_wakers.take();
+        let id = match self.id {
+            | Some(id) => id,
+            | None => {
+                let id = self.shared.next_waiter_id.get();
+                self.shared.next_waiter_id.set(id.wrapping_add(1));
+                self.id = Some(id);
+                id
+            },
+        };
+        if let Some((_, registered)) = waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
+            if !registered.will_wake(waker) {
+                *registered = waker.clone();
+            }
+        } else {
+            waiters.push((id, waker.clone()));
+        }
+        self.shared.tx_wakers.set(waiters);
+    }
+}
+
+impl<T> Drop for SenderRegistration<'_, T> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let mut waiters = self.shared.tx_wakers.take();
+            waiters.retain(|(waiter_id, _)| *waiter_id != id);
+            self.shared.tx_wakers.set(waiters);
+        }
     }
 }
 
@@ -240,13 +285,7 @@ impl<T> Receiver<T> {
         if let Some(value) = (!q.is_empty()).then(|| q.remove(0)) {
             self.shared.queue.set(Some(q));
 
-            let mut wakers = self.shared.tx_wakers.take();
-            if !wakers.is_empty() {
-                for waker in wakers.drain(..) {
-                    waker.wake();
-                }
-            }
-            self.shared.tx_wakers.set(wakers);
+            wake_senders(&self.shared);
 
             return Ok(value);
         }
@@ -300,13 +339,7 @@ impl<T> Receiver<T> {
         self.shared.queue.set(Some(q));
 
         // Space freed up, wake blocked senders
-        let mut wakers = self.shared.tx_wakers.take();
-        if !wakers.is_empty() {
-            for waker in wakers.drain(..) {
-                waker.wake();
-            }
-        }
-        self.shared.tx_wakers.set(wakers);
+        wake_senders(&self.shared);
 
         Ok(results)
     }
@@ -337,16 +370,21 @@ impl<T> Drop for Receiver<T> {
         self.shared.queue.take();
 
         // Wake all blocked senders so they can gracefully exit via PushError
-        let mut wakers = self.shared.tx_wakers.take();
-        for waker in wakers.drain(..) {
-            waker.wake();
-        }
-        self.shared.tx_wakers.set(wakers);
+        wake_senders(&self.shared);
+    }
+}
+
+fn wake_senders<T>(shared: &Shared<T>) {
+    let waiters = shared.tx_wakers.take();
+    for (_, waker) in waiters {
+        waker.wake();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures::poll;
+
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
@@ -403,5 +441,20 @@ mod tests {
 
         let vals = rx.try_pop_many(10).unwrap();
         assert_eq!(vals, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_push_removes_its_waiter() {
+        let (tx, _rx) = channel::<i32>(1);
+        assert!(tx.try_push(1).is_ok());
+        let mut pending = Box::pin(tx.push(2));
+        assert!(poll!(pending.as_mut()).is_pending());
+        assert_eq!(tx.shared.tx_wakers.take().len(), 1);
+        tx.shared.tx_wakers.set(Vec::new());
+
+        // Register again after simulating a wake, then verify cancellation.
+        assert!(poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(tx.shared.tx_wakers.take().is_empty());
     }
 }

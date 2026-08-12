@@ -18,9 +18,10 @@ use std::{
 use smallvec::SmallVec;
 
 struct Inner<T> {
-    value:   Rc<T>,
-    version: u64,
-    wakers:  SmallVec<[Waker; 8]>,
+    value:          Rc<T>,
+    version:        u64,
+    next_waiter_id: usize,
+    waiters:        SmallVec<[(usize, Waker); 8]>,
 }
 
 /// Asynchronous primitive for atomic swapping of Rc pointers.
@@ -37,7 +38,8 @@ impl<T> RcSwap<T> {
             inner: UnsafeCell::new(Inner {
                 value,
                 version: 0,
-                wakers: SmallVec::new(),
+                next_waiter_id: 0,
+                waiters: SmallVec::new(),
             }),
         }
     }
@@ -68,7 +70,10 @@ impl<T> RcSwap<T> {
         let (old_value, wakers) = unsafe {
             let old = ptr::replace(&mut (*ptr).value, value);
             (*ptr).version = (*ptr).version.wrapping_add(1);
-            let wakers = mem::take(&mut (*ptr).wakers);
+            let wakers = mem::take(&mut (*ptr).waiters)
+                .into_iter()
+                .map(|(_, waker)| waker)
+                .collect::<SmallVec<[Waker; 8]>>();
             (old, wakers)
         };
 
@@ -85,10 +90,13 @@ impl<T> RcSwap<T> {
     /// Returns a Future that resolves with the new value once it changes.
     pub fn wait_until_changed(&self) -> WaitUntilChanged<'_, T> {
         // Capture the baseline version at the time the future is created.
+        // SAFETY: the type is `!Sync`, and the value is copied without letting
+        // a reference into the cell escape.
         let version = unsafe { (*self.inner.get()).version };
         WaitUntilChanged {
             swap:          self,
             start_version: version,
+            waiter_id:     None,
         }
     }
 }
@@ -97,29 +105,56 @@ impl<T> RcSwap<T> {
 pub struct WaitUntilChanged<'a, T> {
     swap:          &'a RcSwap<T>,
     start_version: u64,
+    waiter_id:     Option<usize>,
 }
 
 impl<'a, T> Future for WaitUntilChanged<'a, T> {
     type Output = Rc<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let ptr = self.swap.inner.get();
 
         // SAFETY: Safe from concurrent mutation due to !Sync.
         let current_version = unsafe { (*ptr).version };
 
         if current_version != self.start_version {
+            // SAFETY: the type is `!Sync`; cloning does not retain a reference
+            // into the internal cell.
             Poll::Ready(unsafe { (*ptr).value.clone() })
         } else {
-            let wakers = unsafe { &mut (*ptr).wakers };
-
-            // Deduplicate wakers to prevent unbounded memory growth if polled multiple
-            // times.
-            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                wakers.push(cx.waker().clone());
+            let id = match self.waiter_id {
+                | Some(id) => id,
+                | None => {
+                    // SAFETY: single-threaded access and no reference escapes.
+                    let inner = unsafe { &mut *ptr };
+                    let id = inner.next_waiter_id;
+                    inner.next_waiter_id = id.wrapping_add(1);
+                    self.waiter_id = Some(id);
+                    id
+                },
+            };
+            // SAFETY: single-threaded access and no reference escapes.
+            let waiters = unsafe { &mut (*ptr).waiters };
+            if let Some((_, waker)) = waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+            } else {
+                waiters.push((id, cx.waker().clone()));
             }
 
             Poll::Pending
+        }
+    }
+}
+
+impl<T> Drop for WaitUntilChanged<'_, T> {
+    fn drop(&mut self) {
+        if let Some(id) = self.waiter_id {
+            // SAFETY: single-threaded access and no reference escapes.
+            unsafe { &mut *self.swap.inner.get() }
+                .waiters
+                .retain(|(waiter_id, _)| *waiter_id != id);
         }
     }
 }
@@ -149,15 +184,16 @@ mod tests {
 
     #[tokio::test]
     async fn async_rcswap() {
-        let swap = Rc::new(RcSwap::new(Rc::new(10)));
-
-        let s1 = Rc::clone(&swap);
-        task::spawn_local(async move {
-            s1.store(Rc::new(20));
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(*swap.load(), 20);
+        let local = task::LocalSet::new();
+        local
+            .run_until(async move {
+                let swap = Rc::new(RcSwap::new(Rc::new(10)));
+                let changed = Rc::clone(&swap);
+                let task = task::spawn_local(async move { changed.wait_until_changed().await });
+                task::yield_now().await;
+                swap.store(Rc::new(20));
+                assert!(matches!(task.await, Ok(value) if *value == 20));
+            })
+            .await;
     }
 }

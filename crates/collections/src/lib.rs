@@ -1,17 +1,11 @@
-pub mod sync;
-pub mod unsync;
-
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#![no_std]
+//! Fixed-capacity collection types.
+//!
+//! The collections in this crate store their elements inline and never
+//! allocate. They are useful in embedded code and in hot paths where a known
+//! upper bound is preferable to heap growth.
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+extern crate std;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod unsync;

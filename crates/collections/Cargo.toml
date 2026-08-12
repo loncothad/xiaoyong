@@ -1,11 +1,15 @@
 [package]
 name                 = "xiaoyong-collections"
-version              = "0.1.0"
+description          = "Allocation-free, fixed-capacity collection types"
+version              = "1.0.0"
 publish.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 edition.workspace    = true
+rust-version.workspace = true
 license.workspace    = true
+categories           = [ "data-structures", "no-std" ]
+keywords             = [ "array", "fixed-capacity", "no-std" ]
 
 [dependencies]
 

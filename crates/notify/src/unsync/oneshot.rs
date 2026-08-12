@@ -37,10 +37,8 @@ impl Notify {
             self.fired.set(true);
 
             let mut waiters = self.waiters.take();
-            for waker in waiters.drain(..) {
-                if let Some(w) = waker {
-                    w.wake();
-                }
+            for waker in waiters.drain(..).flatten() {
+                waker.wake();
             }
         }
     }

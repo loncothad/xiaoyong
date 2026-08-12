@@ -62,8 +62,18 @@ impl<T> AtomicOnce<T> {
         }
     }
 
+    /// Returns the initialized value without checking for an empty cell.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this cell has been successfully initialized.
+    /// Initialization must not race with destruction of the cell.
     pub unsafe fn get_unchecked(&self) -> &T {
-        unsafe { &**self.ptr.as_ptr() }
+        let pointer = self.ptr.load(Ordering::Acquire);
+        debug_assert!(!pointer.is_null());
+        // SAFETY: upheld by the caller. The Acquire load synchronizes with the
+        // successful initializer's Release operation.
+        unsafe { &*pointer }
     }
 
     /// Attempts to initialize the cell with the provided value.
@@ -149,5 +159,55 @@ impl<T> AtomicOnce<T> {
             // SAFETY: The pointer was valid, and we now take ownership.
             Some(*unsafe { Box::from_raw(p) })
         }
+    }
+}
+
+impl<T> Default for AtomicOnce<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            Barrier,
+        },
+        thread,
+    };
+
+    use super::*;
+
+    #[test]
+    fn initializes_only_once_and_returns_losing_value() {
+        let once = AtomicOnce::new();
+        assert!(once.init(Box::new(10)).is_ok());
+        let result = once.init(Box::new(20));
+        assert!(matches!(result, Err((existing, value)) if *existing == 10 && *value == 20));
+        assert_eq!(once.into_inner(), Some(10));
+    }
+
+    #[test]
+    fn concurrent_initialization_publishes_one_complete_value() {
+        let once = Arc::new(AtomicOnce::new());
+        let barrier = Arc::new(Barrier::new(8));
+        let threads: Vec<_> = (0 .. 8)
+            .map(|value| {
+                let once = Arc::clone(&once);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let _result = once.init(Box::new((value, value * 2)));
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert!(thread.join().is_ok());
+        }
+
+        let (value, doubled) = once.get().copied().expect("one thread must initialize the cell");
+        assert_eq!(doubled, value * 2);
     }
 }

@@ -1,22 +1,21 @@
 # xiaoyong-value
 
-Shared state primitives for sharing state.
+Shared-state primitives for synchronous and asynchronous code.
 
-## Overview
+## Modules
 
-This crate provides shared state primitives like `Mutex` and `RwLock`.
+This crate provides `sync` (thread-safe) and `unsync` (single-threaded)
+primitives. The `unsync` module is intended for executors such as
+`tokio::task::LocalSet`.
 
-The `unsync` module provides primitives tailored for single-threaded executors
-(like `tokio::task::LocalSet`).
-
-### Thread Safety in `unsync`
+### Thread safety
 
 Unlike some other `unsync` types, `xiaoyong_value::unsync::async_mutex::Mutex`
 and `xiaoyong_value::unsync::async_rwlock::RwLock` are built on top of `Cell`
-and `UnsafeCell`. Because they do not use `Rc`, **these types automatically
-implement `Send` if the underlying data `T` is `Send`.**
+and `UnsafeCell`. Because they do not use `Rc`, these types implement `Send`
+when the underlying data `T` implements `Send`.
 
-However, their lock guards (e.g., `MutexGuard`) are explicitly `!Send`.
+However, their lock guards, such as `MutexGuard`, are explicitly `!Send`.
 This guarantees that while you can transfer the `Mutex` itself across threads,
 you cannot lock it on one thread, move the guard to another thread, and unlock
 it there. They must be used within the confines of a single thread at any given
@@ -25,14 +24,28 @@ time.
 `unsync::async_rcswap::RcSwap`, on the other hand, utilizes `Rc` and is strictly
 `!Send`.
 
-## Available Primitives
+## Primitives
 
-* `unsync::async_mutex::Mutex`: An asynchronous, single-threaded Mutex.
-* `unsync::async_rwlock::RwLock`: An asynchronous, single-threaded Reader-Writer
-  Lock.
-* `unsync::async_rcswap::RcSwap`: An asynchronous primitive for atomic swapping
-  of `Rc` pointers.
-* `unsync::rcswap::RcSwap`: A synchronous primitive for atomic swapping of `Rc`
+- `unsync::async_mutex::Mutex`: An asynchronous, single-threaded mutex.
+- `unsync::async_rwlock::RwLock`: An asynchronous, single-threaded reader-writer
+  lock.
+- `unsync::async_rcswap::RcSwap`: An asynchronous primitive for swapping `Rc`
   pointers.
-* `sync::atomic_once::AtomicOnce`: A lightweight, lock-free alternative to `std::sync::OnceLock`.
-* `sync::permanent::Permanent`: Handle to a statically allocated data.
+- `unsync::rcswap::RcSwap`: A synchronous primitive for swapping `Rc`
+  pointers.
+- `sync::arcswap::ArcSwap`: A lock-free snapshot container for swapping
+  `triomphe::Arc` pointers.
+- `sync::async_arcswap::ArcSwap`: A snapshot container whose changes can be
+  awaited. Reads delegate to the lock-free synchronous implementation.
+- `sync::atomic_once::AtomicOnce`: A lightweight, lock-free alternative to
+  `std::sync::OnceLock`.
+- `sync::permanent::Permanent`: A handle to statically allocated data.
+
+## Features
+
+### `arc-swap`
+
+Enables both `sync::arcswap` and `sync::async_arcswap`. This feature is disabled
+by default because these modules use the external `triomphe::Arc` type rather
+than `std::sync::Arc`; the asynchronous variant additionally uses
+`event-listener`.

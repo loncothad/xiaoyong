@@ -29,9 +29,11 @@ struct Inner<T> {
     data:  UnsafeCell<MaybeUninit<T>>,
 }
 
-// Safety: The state machine guarantees exclusive access to the UnsafeCell.
+// SAFETY: The state machine guarantees exclusive access to the UnsafeCell.
 // T must be Send to transfer across thread boundaries safely.
 unsafe impl<T: Send> Send for Inner<T> {}
+// SAFETY: access is synchronized by `state`, and `T: Send` permits transferring
+// ownership between the sender and receiver threads.
 unsafe impl<T: Send> Sync for Inner<T> {}
 
 /// The transmitting half of the channel.
@@ -113,6 +115,7 @@ impl<T> Future for Receiver<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Safe because Receiver is implicitly Unpin
+        // SAFETY: `Receiver` has no structurally pinned fields.
         let this = unsafe { self.get_unchecked_mut() };
 
         let inner_ref = this.inner.as_ref().expect("polled after completion");
@@ -120,6 +123,8 @@ impl<T> Future for Receiver<T> {
         let state = inner_ref.state.load(Ordering::Acquire);
         if state == READY {
             let inner = this.inner.take().unwrap();
+            // SAFETY: `READY` and the Acquire load prove the sender initialized
+            // the value, and only this receiver can move it out.
             let val = unsafe { (*inner.data.get()).assume_init_read() };
             inner.state.store(RX_DROPPED, Ordering::Release);
             return Poll::Ready(Ok(val));
@@ -134,6 +139,7 @@ impl<T> Future for Receiver<T> {
         match inner_ref.state.load(Ordering::Acquire) {
             | READY => {
                 let inner = this.inner.take().unwrap();
+                // SAFETY: as in the fast path above, `READY` proves initialization.
                 let val = unsafe { (*inner.data.get()).assume_init_read() };
                 inner.state.store(RX_DROPPED, Ordering::Release);
                 Poll::Ready(Ok(val))

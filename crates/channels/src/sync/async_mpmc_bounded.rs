@@ -55,8 +55,8 @@ struct SenderState {
 /// The shared state allocated on the heap, referenced by all Senders and
 /// Receivers.
 pub struct Shared<T> {
-    buffer: Box<[Slot<T>]>,
-    mask:   u64,
+    buffer:   Box<[Slot<T>]>,
+    capacity: u64,
 
     /// The global write position. Claimed via Compare-And-Swap (CAS).
     head: CachePadded<AtomicU64>,
@@ -64,13 +64,16 @@ pub struct Shared<T> {
     receivers: Box<[CachePadded<ReceiverState>]>,
     senders:   Box<[CachePadded<SenderState>]>,
 
-    closed:       AtomicBool,
-    sender_count: AtomicUsize,
+    closed:         AtomicBool,
+    sender_count:   AtomicUsize,
+    receiver_count: AtomicUsize,
 }
 
-// Safety: The Shared structure explicitly handles internal mutability and
+// SAFETY: The Shared structure explicitly handles internal mutability and
 // thread synchronization.
 unsafe impl<T: Send + Sync> Send for Shared<T> {}
+// SAFETY: all shared mutations use atomics and slot access is synchronized by
+// the per-slot sequence number.
 unsafe impl<T: Send + Sync> Sync for Shared<T> {}
 
 /// The transmitting half of the channel.
@@ -87,14 +90,11 @@ pub struct Receiver<T> {
 
 /// Create a new bounded channel, returning the sender and receiver halves.
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    assert!(capacity > 0 && capacity.next_power_of_two() != 0, "'capacity' overflow");
+    assert!(capacity > 0, "capacity must be greater than zero");
+    let capacity_u64 = u64::try_from(capacity).expect("capacity does not fit in u64");
 
-    // Force capacity to a power of two to allow bitwise AND instead of modulo.
-    let cap = capacity.next_power_of_two();
-    let mask = (cap - 1) as u64;
-
-    let mut buffer = Vec::with_capacity(cap);
-    for _ in 0 .. cap {
+    let mut buffer = Vec::with_capacity(capacity);
+    for _ in 0 .. capacity {
         buffer.push(Slot {
             sequence: AtomicU64::new(0),
             data:     UnsafeCell::new(MaybeUninit::uninit()),
@@ -119,13 +119,14 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     }
 
     let shared = Arc::new(Shared {
-        buffer: buffer.into_boxed_slice(),
-        mask,
-        head: CachePadded::new(AtomicU64::new(0)),
-        receivers: receivers.into_boxed_slice(),
-        senders: senders.into_boxed_slice(),
-        closed: AtomicBool::new(false),
-        sender_count: AtomicUsize::new(1),
+        buffer:         buffer.into_boxed_slice(),
+        capacity:       capacity_u64,
+        head:           CachePadded::new(AtomicU64::new(0)),
+        receivers:      receivers.into_boxed_slice(),
+        senders:        senders.into_boxed_slice(),
+        closed:         AtomicBool::new(false),
+        sender_count:   AtomicUsize::new(1),
+        receiver_count: AtomicUsize::new(1),
     });
 
     // Initialize the primary sender and receiver to index 0.
@@ -186,7 +187,10 @@ impl<T> Shared<T> {
 
     /// Try to push a value into the channel without blocking.
     pub fn try_push(&self, value: T) -> Result<(), T> {
-        let cap = self.mask + 1;
+        if self.receiver_count.load(Ordering::Acquire) == 0 {
+            return Err(value);
+        }
+        let cap = self.capacity;
         let mut head = self.head.load(Ordering::Acquire);
 
         loop {
@@ -201,7 +205,10 @@ impl<T> Shared<T> {
                 .compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 | Ok(_) => {
-                    let slot = &self.buffer[(head & self.mask) as usize];
+                    let slot = &self.buffer[(head % self.capacity) as usize];
+                    // SAFETY: this producer exclusively claimed `head`, and
+                    // the capacity check proves every receiver has left the
+                    // previous value in this slot.
                     unsafe {
                         let arc = Arc::new(value);
                         if head >= cap {
@@ -223,7 +230,10 @@ impl<T> Shared<T> {
 
     /// Try to push multiple values into the channel without blocking.
     pub fn try_push_many(&self, mut values: Vec<T>) -> Result<(), Vec<T>> {
-        let cap = self.mask + 1;
+        if self.receiver_count.load(Ordering::Acquire) == 0 {
+            return Err(values);
+        }
+        let cap = self.capacity;
         let mut head = self.head.load(Ordering::Acquire);
 
         loop {
@@ -242,7 +252,9 @@ impl<T> Shared<T> {
             {
                 for (i, val) in values.drain(.. claim).enumerate() {
                     let curr_h = head + i as u64;
-                    let slot = &self.buffer[(curr_h & self.mask) as usize];
+                    let slot = &self.buffer[(curr_h % self.capacity) as usize];
+                    // SAFETY: this producer exclusively claimed `curr_h`, and
+                    // the capacity check proves the previous value is unused.
                     unsafe {
                         let arc = Arc::new(val);
                         if curr_h >= cap {
@@ -270,11 +282,13 @@ impl<T> Shared<T> {
         let rx = &self.receivers[rx_id];
         let tail = rx.tail.load(Ordering::Relaxed);
 
-        let slot = &self.buffer[(tail & self.mask) as usize];
+        let slot = &self.buffer[(tail % self.capacity) as usize];
         let seq = slot.sequence.load(Ordering::Acquire);
 
         // Sequence == tail + 1 means the producer has fully committed the write
         if seq == tail + 1 {
+            // SAFETY: the matching sequence proves the producer committed a
+            // fully initialized `Arc`; advancing the tail happens afterwards.
             let data = unsafe { (*slot.data.get()).assume_init_ref().clone() };
             // Advance this receiver's individual tail
             rx.tail.store(tail + 1, Ordering::Release);
@@ -293,8 +307,10 @@ impl<T> Shared<T> {
 
         // Fast-path contiguous reading without touching atomic tail on every item
         for _ in 0 .. max {
-            let slot = &self.buffer[(tail & self.mask) as usize];
+            let slot = &self.buffer[(tail % self.capacity) as usize];
             if slot.sequence.load(Ordering::Acquire) == tail + 1 {
+                // SAFETY: the matching sequence proves this slot contains the
+                // committed value for `tail`.
                 results.push(unsafe { (*slot.data.get()).assume_init_ref().clone() });
                 tail += 1;
             } else {
@@ -312,6 +328,37 @@ impl<T> Shared<T> {
 }
 
 impl<T> Sender<T> {
+    /// Attempts to push a value without waiting for capacity.
+    pub fn try_push(&self, value: T) -> Result<(), T> {
+        self.shared.try_push(value)
+    }
+
+    /// Attempts to push values without waiting, returning the unpushed suffix.
+    pub fn try_push_many(&self, values: Vec<T>) -> Result<(), Vec<T>> {
+        self.shared.try_push_many(values)
+    }
+
+    /// Attempts to create another producer handle.
+    ///
+    /// Returns `None` when the channel already has the maximum number of
+    /// simultaneously active senders.
+    pub fn try_clone(&self) -> Option<Self> {
+        for (id, sender) in self.shared.senders.iter().enumerate() {
+            if sender
+                .active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.shared.sender_count.fetch_add(1, Ordering::AcqRel);
+                return Some(Self {
+                    shared: Arc::clone(&self.shared),
+                    id,
+                });
+            }
+        }
+        None
+    }
+
     /// Push a value into the channel.
     pub async fn push(&self, value: T) -> Result<(), T> {
         PushFuture {
@@ -344,6 +391,7 @@ impl<T> Receiver<T> {
                 {
                     rx.tail
                         .store(self.shared.head.load(Ordering::Acquire), Ordering::Release);
+                    self.shared.receiver_count.fetch_add(1, Ordering::AcqRel);
                     return Some(Receiver {
                         shared: self.shared.clone(),
                         id,
@@ -355,7 +403,7 @@ impl<T> Receiver<T> {
     }
 
     /// Asynchronously pops a value from the channel.
-    pub async fn pop(&self) -> Option<Arc<T>> {
+    pub async fn pop(&mut self) -> Option<Arc<T>> {
         PopFuture {
             receiver: self
         }
@@ -363,7 +411,10 @@ impl<T> Receiver<T> {
     }
 
     /// Asynchronously pops multiple values from the channel.
-    pub async fn pop_many(&self, max: usize) -> Vec<Arc<T>> {
+    pub async fn pop_many(&mut self, max: usize) -> Vec<Arc<T>> {
+        if max == 0 {
+            return Vec::new();
+        }
         PopManyFuture {
             receiver: self,
             max,
@@ -383,6 +434,7 @@ impl<'a, T> Future for PushFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // SAFETY: Struct contains no structurally pinned fields. Unpin projection is
         // safe.
+        // SAFETY: the future has no structurally pinned fields.
         let this = unsafe { self.get_unchecked_mut() };
         let val = this.value.take().expect("polled after ready");
 
@@ -390,6 +442,9 @@ impl<'a, T> Future for PushFuture<'a, T> {
             | Ok(_) => Poll::Ready(Ok(())),
             | Err(v) => {
                 if this.sender.shared.closed.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(v));
+                }
+                if this.sender.shared.receiver_count.load(Ordering::Acquire) == 0 {
                     return Poll::Ready(Err(v));
                 }
 
@@ -417,6 +472,7 @@ impl<'a, T> Future for PushManyFuture<'a, T> {
     type Output = Result<(), Vec<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: the future has no structurally pinned fields.
         let this = unsafe { self.get_unchecked_mut() };
         let vals = this.values.take().expect("polled after ready");
 
@@ -424,6 +480,9 @@ impl<'a, T> Future for PushManyFuture<'a, T> {
             | Ok(_) => Poll::Ready(Ok(())),
             | Err(rem) => {
                 if this.sender.shared.closed.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(rem));
+                }
+                if this.sender.shared.receiver_count.load(Ordering::Acquire) == 0 {
                     return Poll::Ready(Err(rem));
                 }
 
@@ -449,6 +508,7 @@ impl<'a, T> Future for PopFuture<'a, T> {
     type Output = Option<Arc<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: the future has no structurally pinned fields.
         let this = unsafe { self.get_unchecked_mut() };
 
         if let Some(val) = this.receiver.shared.try_pop(this.receiver.id) {
@@ -480,6 +540,7 @@ impl<'a, T> Future for PopManyFuture<'a, T> {
     type Output = Vec<Arc<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: the future has no structurally pinned fields.
         let this = unsafe { self.get_unchecked_mut() };
 
         let res = this.receiver.shared.try_pop_many(this.receiver.id, this.max);
@@ -506,24 +567,7 @@ impl<'a, T> Future for PopManyFuture<'a, T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.shared.sender_count.fetch_add(1, Ordering::SeqCst);
-        let mut new_id = None;
-        for (id, tx) in self.shared.senders.iter().enumerate() {
-            if !tx.active.load(Ordering::Acquire) {
-                if tx
-                    .active
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    new_id = Some(id);
-                    break;
-                }
-            }
-        }
-        Sender {
-            shared: self.shared.clone(),
-            id:     new_id.expect("Max senders exceeded"),
-        }
+        self.try_clone().expect("maximum number of channel senders exceeded")
     }
 }
 
@@ -543,6 +587,7 @@ impl<T> Drop for Receiver<T> {
         rx.active.store(false, Ordering::Release);
         // Advance out of bounds so this consumer no longer throttles min_tail
         rx.tail.store(u64::MAX, Ordering::Release);
+        self.shared.receiver_count.fetch_sub(1, Ordering::AcqRel);
         self.shared.wake_producers();
     }
 }
@@ -550,13 +595,15 @@ impl<T> Drop for Receiver<T> {
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         let head = self.head.load(Ordering::Acquire);
-        let cap = self.mask + 1;
+        let cap = self.capacity;
         let start = head.saturating_sub(cap);
 
         // Ensure remaining undropped inner Arc values are freed.
         for i in start .. head {
-            let slot = &self.buffer[(i & self.mask) as usize];
+            let slot = &self.buffer[(i % self.capacity) as usize];
             if slot.sequence.load(Ordering::Acquire) == i + 1 {
+                // SAFETY: `self` is being destroyed, so no handle can access
+                // the slots; the sequence check proves this slot is initialized.
                 unsafe {
                     (*slot.data.get()).assume_init_drop();
                 }
@@ -575,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic_push_pop() {
-        let (tx, rx) = channel::<i32>(4);
+        let (tx, mut rx) = channel::<i32>(4);
 
         tx.push(10).await.unwrap();
         tx.push(20).await.unwrap();
@@ -586,8 +633,8 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_semantics() {
-        let (tx, rx1) = channel::<String>(4);
-        let rx2 = rx1.subscribe().unwrap();
+        let (tx, mut rx1) = channel::<String>(4);
+        let mut rx2 = rx1.subscribe().unwrap();
 
         tx.push("Hello".to_string()).await.unwrap();
         tx.push("World".to_string()).await.unwrap();
@@ -600,7 +647,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_pop_many() {
-        let (tx, rx) = channel::<i32>(8);
+        let (tx, mut rx) = channel::<i32>(8);
 
         tx.push_many(vec![1, 2, 3]).await.unwrap();
         tx.push_many(vec![4, 5]).await.unwrap();
@@ -617,7 +664,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_wait_on_empty() {
-        let (tx, rx) = channel::<i32>(4);
+        let (tx, mut rx) = channel::<i32>(4);
 
         let recv_task = tokio::spawn(async move { *rx.pop().await.unwrap() });
 
@@ -629,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_wait_on_full() {
-        let (tx, rx) = channel::<i32>(2);
+        let (tx, mut rx) = channel::<i32>(2);
 
         tx.push(1).await.unwrap();
         tx.push(2).await.unwrap();
@@ -649,7 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_close_on_tx_drop() {
-        let (tx, rx) = channel::<i32>(4);
+        let (tx, mut rx) = channel::<i32>(4);
 
         tx.push(1).await.unwrap();
         drop(tx);
@@ -659,8 +706,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_non_power_of_two_capacity_and_zero_batch() {
+        let (tx, mut rx) = channel::<i32>(3);
+        assert!(tx.try_push(1).is_ok());
+        assert!(tx.try_push(2).is_ok());
+        assert!(tx.try_push(3).is_ok());
+        assert_eq!(tx.try_push(4), Err(4));
+        assert!(rx.pop_many(0).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_fails_after_last_receiver_is_dropped() {
+        let (tx, rx) = channel::<i32>(2);
+        drop(rx);
+        assert_eq!(tx.push(42).await, Err(42));
+    }
+
+    #[tokio::test]
     async fn slow_receiver_blocks_producer() {
-        let (tx, rx1) = channel::<i32>(2);
+        let (tx, mut rx1) = channel::<i32>(2);
         let rx2 = rx1.subscribe().unwrap();
 
         tx.push(1).await.unwrap();
@@ -680,7 +744,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_producers() {
-        let (tx, rx) = channel::<i32>(128);
+        let (tx, mut rx) = channel::<i32>(128);
         const NUM_PRODUCERS: usize = 4;
         const ITEMS_PER_PRODUCER: i32 = 1000;
 
@@ -696,7 +760,7 @@ mod tests {
         drop(tx);
 
         let mut received = 0;
-        while let Some(_) = rx.pop().await {
+        while rx.pop().await.is_some() {
             received += 1;
         }
 
@@ -709,15 +773,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_broadcast_consumers() {
-        let (tx, rx1) = channel::<i32>(64);
-        let rx2 = rx1.subscribe().unwrap();
-        let rx3 = rx1.subscribe().unwrap();
+        let (tx, mut rx1) = channel::<i32>(64);
+        let mut rx2 = rx1.subscribe().unwrap();
+        let mut rx3 = rx1.subscribe().unwrap();
 
         const ITEMS: i32 = 2000;
 
         let t1 = tokio::spawn(async move {
             let mut count = 0;
-            while let Some(_) = rx1.pop().await {
+            while rx1.pop().await.is_some() {
                 count += 1;
             }
             count
@@ -725,7 +789,7 @@ mod tests {
 
         let t2 = tokio::spawn(async move {
             let mut count = 0;
-            while let Some(_) = rx2.pop().await {
+            while rx2.pop().await.is_some() {
                 count += 1;
             }
             count
@@ -733,7 +797,7 @@ mod tests {
 
         let t3 = tokio::spawn(async move {
             let mut count = 0;
-            while let Some(_) = rx3.pop().await {
+            while rx3.pop().await.is_some() {
                 count += 1;
             }
             count
@@ -776,7 +840,7 @@ mod tests {
         drop(tx);
 
         let mut recv_tasks = vec![];
-        for rx in receivers {
+        for mut rx in receivers {
             recv_tasks.push(tokio::spawn(async move {
                 let mut sum = 0;
                 while let Some(v) = rx.pop().await {

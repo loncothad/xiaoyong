@@ -1,4 +1,4 @@
-//! `!Sync` implementations.
+//! Single-threaded shared-state primitives.
 
 pub mod async_mutex;
 pub mod async_rcswap;

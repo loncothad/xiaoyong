@@ -14,10 +14,12 @@ pub struct Permanent<T: 'static> {
     inner: &'static T,
 }
 
-// Safety: Permanent<T> is Send/Sync if the underlying T is Sync.
+// SAFETY: Permanent<T> is Send/Sync if the underlying T is Sync.
 // Since we only provide &T access, T does not strictly need to be Send
 // for the handle to be Sync, but usually, we want T: Send + Sync.
 unsafe impl<T: Sync + 'static> Send for Permanent<T> {}
+// SAFETY: `Permanent` exposes only shared references, so sharing the handle is
+// safe exactly when `T` can be shared.
 unsafe impl<T: Sync + 'static> Sync for Permanent<T> {}
 
 impl<T: 'static> Permanent<T> {
@@ -39,6 +41,8 @@ impl<T: 'static> Permanent<T> {
     /// - This function is called exactly once for the allocated memory.
     pub unsafe fn drop_permanent(self) {
         let ptr = self.inner as *const T as *mut T;
+        // SAFETY: the method's contract guarantees unique ownership of the
+        // original leaked allocation.
         unsafe {
             mem::drop(Box::from_raw(ptr));
         }

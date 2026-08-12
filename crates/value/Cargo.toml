@@ -1,26 +1,32 @@
 [package]
 name                 = "xiaoyong-value"
-description          = "Collection of sharing state primitives for async contexts (both Sync and !Sync)"
-version              = "2.1.0"
+description          = "Shared-state primitives for synchronous and asynchronous contexts"
+version              = "3.0.0"
 publish.workspace    = true
 authors.workspace    = true
 repository.workspace = true
 edition.workspace    = true
+rust-version.workspace = true
 license.workspace    = true
 categories           = [ "asynchronous", "data-structures", "rust-patterns" ]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true
 
 [features]
-alloc   = [  ]
-default = [ "std" ]
-std     = [ "alloc" ]
+default = [  ]
+# Opt-in because these types use the external `triomphe::Arc` rather than the
+# standard library's `std::sync::Arc`.
+arc-swap = [ "dep:event-listener", "dep:triomphe" ]
 
 [dev-dependencies]
 tokio.workspace = true
+futures.workspace = true
 
 [dependencies]
-smallvec.workspace        = true
-triomphe.workspace        = true
-crossbeam-utils.workspace = true
+smallvec.workspace = true
+triomphe = { workspace = true, optional = true }
+event-listener = { workspace = true, optional = true }
