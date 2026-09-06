@@ -8,7 +8,7 @@ thread-safe (`sync`) and single-threaded (`unsync`) implementations.
 This crate provides asynchronous channels optimized for different use cases:
 
 - `sync`: Thread-safe channels for cross-task communication in multithreaded
-  executors. These use atomic operations and `Arc` to share state safely.
+  executors. These use `Arc` with atomics or a short mutex to share state safely.
 - `unsync`: Single-threaded channels for tasks that remain on one thread, such
   as tasks running in `tokio::task::LocalSet`. These use `Rc` and `Cell` to
   avoid atomic overhead and are `!Send`.
@@ -17,8 +17,12 @@ This crate provides asynchronous channels optimized for different use cases:
 
 ### Multi-Producer, Multi-Consumer (MPMC) Fixed
 
-- `sync::async_mpmc_bounded`: A bounded MPMC broadcast channel using a
-  sequence-locked ring buffer.
+- `sync::async_mpmc_bounded`: A bounded MPMC broadcast channel with a mutex
+  protecting buffer ownership and subscription changes. Independent event
+  listeners support simultaneous pending sends on the same handle. Each
+  receiver sees every value sent after it subscribes; the slowest receiver
+  applies backpressure. Receivers implement `futures::Stream` and provide
+  `try_pop`, `try_pop_many`, and `is_closed`.
 
 ### Multi-Producer, Single-Consumer (MPSC) Fixed
 
@@ -38,3 +42,16 @@ This crate provides asynchronous channels optimized for different use cases:
 - `sync::async_oneshot`: A thread-safe, single-use channel for transferring a
   single value.
 - `unsync::async_oneshot`: A single-threaded oneshot channel.
+
+## Migrating to 3.0
+
+SPSC send and receive operations now require `&mut self`. Declare endpoints
+with `let (mut producer, mut consumer) = channel(capacity)` and keep at most
+one pending operation per endpoint. This enforces the exclusive access required
+by the underlying buffer.
+
+The broadcast channel now uses a mutex rather than the previous atomic slot
+algorithm, fixing races during subscription reuse and value reclamation. Its
+performance characteristics have changed; benchmark latency-sensitive workloads.
+Consumed values are reclaimed once every subscribed receiver has advanced.
+Zero-length batch operations return immediately, including on closed channels.

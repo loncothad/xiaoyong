@@ -38,6 +38,27 @@ unsafe impl<T: Send> Send for Shared<T> {}
 // publish progress using Acquire/Release atomics.
 unsafe impl<T: Send> Sync for Shared<T> {}
 
+impl<T> Shared<T> {
+    // Use a period divisible by capacity so arbitrary capacities remain valid
+    // at counter rollover. The second lap distinguishes full from empty.
+    fn advance(&self, cursor: usize, amount: usize) -> usize {
+        let until_wrap = self.capacity * 2 - cursor;
+        if amount >= until_wrap {
+            amount - until_wrap
+        } else {
+            cursor + amount
+        }
+    }
+
+    fn distance(&self, head: usize, tail: usize) -> usize {
+        if head >= tail {
+            head - tail
+        } else {
+            head + (self.capacity * 2 - tail)
+        }
+    }
+}
+
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         let head = self.head.load(Ordering::Acquire);
@@ -52,19 +73,36 @@ impl<T> Drop for Shared<T> {
             unsafe {
                 self.buffer[index].get().read().assume_init_drop();
             }
-            current = current.wrapping_add(1);
+            current = self.advance(current, 1);
         }
     }
 }
 
 /// The transmitting half of the SPSC channel.
+///
+/// Operations require exclusive access, enforcing one active producer.
+///
+/// ```compile_fail
+/// let (producer, _) = xiaoyong_channels::sync::async_spsc_bounded::channel(1);
+/// let shared = &producer;
+/// shared.try_push(1).unwrap();
+/// ```
 pub struct Producer<T>(Arc<Shared<T>>);
 /// The receiving half of the SPSC channel.
+///
+/// Operations require exclusive access, enforcing one active consumer.
+///
+/// ```compile_fail
+/// let (_, consumer) = xiaoyong_channels::sync::async_spsc_bounded::channel::<i32>(1);
+/// let shared = &consumer;
+/// shared.try_pop();
+/// ```
 pub struct Consumer<T>(Arc<Shared<T>>);
 
 /// Creates a new lock-free SPSC channel with a fixed capacity.
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     assert!(capacity > 0, "Capacity must be greater than 0");
+    assert!(capacity <= usize::MAX / 2, "Capacity is too large");
 
     let mut buffer = Vec::with_capacity(capacity);
     for _ in 0 .. capacity {
@@ -93,14 +131,14 @@ impl<T> Producer<T> {
     }
 
     /// Try to push a single item.
-    pub fn try_push(&self, item: T) -> Result<(), T> {
+    pub fn try_push(&mut self, item: T) -> Result<(), T> {
         if !self.0.consumer_alive.load(Ordering::Acquire) {
             return Err(item);
         }
         let head = self.0.head.load(Ordering::Relaxed);
         let tail = self.0.tail.load(Ordering::Acquire);
 
-        if head.wrapping_sub(tail) >= self.0.capacity {
+        if self.0.distance(head, tail) >= self.0.capacity {
             return Err(item);
         }
 
@@ -111,21 +149,21 @@ impl<T> Producer<T> {
             (*self.0.buffer[index].get()).write(item);
         }
 
-        self.0.head.store(head.wrapping_add(1), Ordering::Release);
+        self.0.head.store(self.0.advance(head, 1), Ordering::Release);
         self.0.consumer_waker.wake();
         Ok(())
     }
 
     /// Try to push as many items as possible from an
     /// iterator. Returns the number of items successfully pushed.
-    pub fn try_push_many<I: Iterator<Item = T>>(&self, items: &mut I) -> usize {
+    pub fn try_push_many<I: Iterator<Item = T>>(&mut self, items: &mut I) -> usize {
         if !self.0.consumer_alive.load(Ordering::Acquire) {
             return 0;
         }
         let head = self.0.head.load(Ordering::Relaxed);
         let tail = self.0.tail.load(Ordering::Acquire);
 
-        let available = self.0.capacity - head.wrapping_sub(tail);
+        let available = self.0.capacity - self.0.distance(head, tail);
         if available == 0 {
             return 0;
         }
@@ -134,21 +172,18 @@ impl<T> Producer<T> {
         for _ in 0 .. available {
             match items.next() {
                 | Some(item) => {
-                    let index = (head.wrapping_add(pushed)) % self.0.capacity;
+                    let index = self.0.advance(head, pushed) % self.0.capacity;
                     // SAFETY: each offset below `available` is an exclusively
                     // producer-owned free slot.
                     unsafe {
                         (*self.0.buffer[index].get()).write(item);
                     }
                     pushed += 1;
+                    self.0.head.store(self.0.advance(head, pushed), Ordering::Release);
+                    self.0.consumer_waker.wake();
                 },
                 | None => break,
             }
-        }
-
-        if pushed > 0 {
-            self.0.head.store(head.wrapping_add(pushed), Ordering::Release);
-            self.0.consumer_waker.wake();
         }
 
         pushed
@@ -157,25 +192,16 @@ impl<T> Producer<T> {
     /// Pushes one item, suspending while the queue is full.
     ///
     /// Returns the item if the consumer has been dropped.
-    pub async fn push(&self, item: T) -> Result<(), T> {
+    pub async fn push(&mut self, item: T) -> Result<(), T> {
         let mut item = Some(item);
         poll_fn(move |cx| {
-            let val = item.take().expect("push future polled after completion");
-            match self.try_push(val) {
+            self.0.producer_waker.register(cx.waker());
+            let value = item.take().expect("push future polled after completion");
+            match self.try_push(value) {
                 | Ok(()) => Poll::Ready(Ok(())),
-                | Err(ret) => {
-                    if !self.0.consumer_alive.load(Ordering::Acquire) {
-                        return Poll::Ready(Err(ret));
-                    }
-                    item = Some(ret);
-                    self.0.producer_waker.register(cx.waker());
-
-                    // Double check to prevent missed wakeups
-                    let head = self.0.head.load(Ordering::Relaxed);
-                    let tail = self.0.tail.load(Ordering::Acquire);
-                    if self.0.capacity - head.wrapping_sub(tail) > 0 {
-                        cx.waker().wake_by_ref();
-                    }
+                | Err(value) if self.is_closed() => Poll::Ready(Err(value)),
+                | Err(value) => {
+                    item = Some(value);
                     Poll::Pending
                 },
             }
@@ -186,28 +212,21 @@ impl<T> Producer<T> {
     /// Pushes all items, suspending while the queue is full.
     ///
     /// Returns the unpushed suffix if the consumer is dropped.
-    pub async fn push_many<I: IntoIterator<Item = T>>(&self, items: I) -> Result<(), Vec<T>> {
+    pub async fn push_many<I: IntoIterator<Item = T>>(&mut self, items: I) -> Result<(), Vec<T>> {
         let mut remaining = items.into_iter().collect::<VecDeque<_>>();
         poll_fn(move |cx| {
+            self.0.producer_waker.register(cx.waker());
             while let Some(item) = remaining.pop_front() {
                 if let Err(item) = self.try_push(item) {
                     remaining.push_front(item);
                     break;
                 }
             }
-
             if remaining.is_empty() {
                 Poll::Ready(Ok(()))
-            } else if !self.0.consumer_alive.load(Ordering::Acquire) {
+            } else if self.is_closed() {
                 Poll::Ready(Err(remaining.drain(..).collect()))
             } else {
-                self.0.producer_waker.register(cx.waker());
-
-                let head = self.0.head.load(Ordering::Relaxed);
-                let tail = self.0.tail.load(Ordering::Acquire);
-                if self.0.capacity - head.wrapping_sub(tail) > 0 {
-                    cx.waker().wake_by_ref();
-                }
                 Poll::Pending
             }
         })
@@ -217,7 +236,7 @@ impl<T> Producer<T> {
 
 impl<T> Consumer<T> {
     /// Try to pop a single item.
-    pub fn try_pop(&self) -> Option<T> {
+    pub fn try_pop(&mut self) -> Option<T> {
         let tail = self.0.tail.load(Ordering::Relaxed);
         let head = self.0.head.load(Ordering::Acquire);
 
@@ -230,17 +249,17 @@ impl<T> Consumer<T> {
         // and the unique consumer owns it until advancing `tail`.
         let item = unsafe { self.0.buffer[index].get().read().assume_init() };
 
-        self.0.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.0.tail.store(self.0.advance(tail, 1), Ordering::Release);
         self.0.producer_waker.wake();
         Some(item)
     }
 
     /// Try to pop up to `limit` items.
-    pub fn try_pop_many(&self, limit: usize) -> Vec<T> {
+    pub fn try_pop_many(&mut self, limit: usize) -> Vec<T> {
         let tail = self.0.tail.load(Ordering::Relaxed);
         let head = self.0.head.load(Ordering::Acquire);
 
-        let available = head.wrapping_sub(tail);
+        let available = self.0.distance(head, tail);
         let to_pop = available.min(limit);
 
         if to_pop == 0 {
@@ -249,14 +268,14 @@ impl<T> Consumer<T> {
 
         let mut result = Vec::with_capacity(to_pop);
         for i in 0 .. to_pop {
-            let index = (tail.wrapping_add(i)) % self.0.capacity;
+            let index = (self.0.advance(tail, i)) % self.0.capacity;
             // SAFETY: every offset below `to_pop` was published by the producer
             // and is exclusively owned by this consumer.
             let item = unsafe { self.0.buffer[index].get().read().assume_init() };
             result.push(item);
         }
 
-        self.0.tail.store(tail.wrapping_add(to_pop), Ordering::Release);
+        self.0.tail.store(self.0.advance(tail, to_pop), Ordering::Release);
         self.0.producer_waker.wake();
         result
     }
@@ -264,46 +283,37 @@ impl<T> Consumer<T> {
     /// Pops one item, suspending while the queue is empty.
     ///
     /// Returns `None` after the producer is dropped and buffered items drain.
-    pub async fn pop(&self) -> Option<T> {
+    pub async fn pop(&mut self) -> Option<T> {
         poll_fn(|cx| {
-            match self.try_pop() {
-                | Some(item) => Poll::Ready(Some(item)),
-                | None if !self.0.producer_alive.load(Ordering::Acquire) => Poll::Ready(None),
-                | None => {
-                    self.0.consumer_waker.register(cx.waker());
-
-                    let tail = self.0.tail.load(Ordering::Relaxed);
-                    let head = self.0.head.load(Ordering::Acquire);
-                    if head != tail {
-                        cx.waker().wake_by_ref();
-                    }
-                    Poll::Pending
-                },
+            self.0.consumer_waker.register(cx.waker());
+            if let Some(item) = self.try_pop() {
+                return Poll::Ready(Some(item));
             }
+            if self.is_closed() {
+                // The close Acquire synchronizes with the final publication.
+                return Poll::Ready(self.try_pop());
+            }
+            Poll::Pending
         })
         .await
     }
 
     /// Pop up to `limit` items, suspending until at least 1
     /// item is available.
-    pub async fn pop_many(&self, limit: usize) -> Vec<T> {
-        assert!(limit > 0, "Limit must be greater than 0");
+    pub async fn pop_many(&mut self, limit: usize) -> Vec<T> {
+        if limit == 0 {
+            return Vec::new();
+        }
         poll_fn(|cx| {
-            let res = self.try_pop_many(limit);
-            if !res.is_empty() {
-                Poll::Ready(res)
-            } else if !self.0.producer_alive.load(Ordering::Acquire) {
-                Poll::Ready(Vec::new())
-            } else {
-                self.0.consumer_waker.register(cx.waker());
-
-                let tail = self.0.tail.load(Ordering::Relaxed);
-                let head = self.0.head.load(Ordering::Acquire);
-                if head != tail {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Pending
+            self.0.consumer_waker.register(cx.waker());
+            let items = self.try_pop_many(limit);
+            if !items.is_empty() {
+                return Poll::Ready(items);
             }
+            if self.is_closed() {
+                return Poll::Ready(self.try_pop_many(limit));
+            }
+            Poll::Pending
         })
         .await
     }
@@ -345,7 +355,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_push_pop() {
-        let (producer, consumer) = channel(2);
+        let (mut producer, mut consumer) = channel(2);
 
         assert_eq!(producer.try_push(1), Ok(()));
         assert_eq!(producer.try_push(2), Ok(()));
@@ -358,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_push_pop() {
-        let (producer, consumer) = channel(2);
+        let (mut producer, mut consumer) = channel(2);
 
         assert!(producer.push(10).await.is_ok());
         assert!(producer.push(20).await.is_ok());
@@ -369,7 +379,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_batch_concurrency() {
-        let (producer, consumer) = channel(100);
+        let (mut producer, mut consumer) = channel(100);
         let items_to_send = 5000;
 
         let producer_handle = task::spawn(async move {
@@ -397,7 +407,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heavy_concurrency_single_elements() {
-        let (producer, consumer) = channel(10);
+        let (mut producer, mut consumer) = channel(10);
         let items_to_send = 10_000;
         let sum = Arc::new(AtomicUsize::new(0));
 
@@ -424,12 +434,76 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_drop_wakes_peer() {
-        let (producer, consumer) = channel::<i32>(1);
+        let (mut producer, consumer) = channel::<i32>(1);
         drop(consumer);
         assert_eq!(producer.push(1).await, Err(1));
 
-        let (producer, consumer) = channel::<i32>(1);
+        let (producer, mut consumer) = channel::<i32>(1);
         drop(producer);
         assert_eq!(consumer.pop().await, None);
+    }
+
+    #[test]
+    fn non_power_of_two_capacity_survives_counter_rollover() {
+        let (mut tx, mut rx) = channel(3);
+        // Seed an empty queue at the last position of the counter period.
+        tx.0.head.store(5, Ordering::Relaxed);
+        tx.0.tail.store(5, Ordering::Relaxed);
+        assert_eq!(tx.try_push_many(&mut [1, 2, 3].into_iter()), 3);
+        assert_eq!(tx.try_push(4), Err(4));
+        assert_eq!(rx.try_pop_many(3), vec![1, 2, 3]);
+        for value in 4 .. 40 {
+            assert_eq!(tx.try_push(value), Ok(()));
+            assert_eq!(rx.try_pop(), Some(value));
+        }
+    }
+
+    #[test]
+    fn panicking_batch_iterator_publishes_initialized_prefix() {
+        use std::panic::{
+            AssertUnwindSafe,
+            catch_unwind,
+        };
+        let (mut tx, mut rx) = channel(3);
+        let mut next = 0;
+        let mut values = std::iter::from_fn(|| {
+            next += 1;
+            assert!(next != 2, "iterator panic");
+            Some(String::from("first"))
+        });
+        assert!(catch_unwind(AssertUnwindSafe(|| tx.try_push_many(&mut values))).is_err());
+        assert_eq!(rx.try_pop().as_deref(), Some("first"));
+        assert_eq!(tx.try_push(String::from("second")), Ok(()));
+        assert_eq!(rx.try_pop().as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn pending_operations_wake_when_peer_drops() {
+        use futures::poll;
+        use tokio::time::{
+            Duration,
+            timeout,
+        };
+        let (mut tx, rx) = channel(1);
+        tx.try_push(1).unwrap();
+        let mut pending = Box::pin(tx.push(2));
+        assert!(poll!(pending.as_mut()).is_pending());
+        drop(rx);
+        assert_eq!(timeout(Duration::from_secs(1), pending).await.unwrap(), Err(2));
+        let (tx, mut rx) = channel::<i32>(1);
+        let mut pending = Box::pin(rx.pop());
+        assert!(poll!(pending.as_mut()).is_pending());
+        drop(tx);
+        assert_eq!(timeout(Duration::from_secs(1), pending).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn zero_batch_and_final_buffer_drain() {
+        let (mut tx, mut rx) = channel(2);
+        assert!(rx.pop_many(0).await.is_empty());
+        tx.push_many([1, 2]).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.pop_many(10).await, vec![1, 2]);
+        assert_eq!(rx.pop().await, None);
     }
 }

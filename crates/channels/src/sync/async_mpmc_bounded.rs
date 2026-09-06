@@ -1,566 +1,320 @@
-//! A thread-safe, bounded, multi-producer multi-consumer (MPMC) broadcast
-//! channel.
+//! A thread-safe, bounded MPMC broadcast channel.
+//!
+//! A short mutex protects buffer ownership and receiver registration together.
+//! Tasks wait for capacity or values using independent event listeners.
 
 use std::{
-    cell::UnsafeCell,
+    collections::VecDeque,
     future::Future,
-    mem::MaybeUninit,
     pin::Pin,
-    sync::atomic::{
-        AtomicBool,
-        AtomicU64,
-        AtomicUsize,
-        Ordering,
-    },
+    sync::Mutex,
     task::{
         Context,
         Poll,
     },
 };
 
-use crossbeam_utils::CachePadded;
-use futures::task::AtomicWaker;
+use event_listener::{
+    Event,
+    EventListener,
+};
+use futures::Stream;
+use smallvec::SmallVec;
 use triomphe::Arc;
 
 const MAX_RECEIVERS: usize = 128;
 const MAX_SENDERS: usize = 128;
 
-/// Represents a single memory slot in the ring buffer.
-/// Relies on a sequence lock to coordinate lock-free access.
-struct Slot<T> {
-    /// The sequence number dictates access rights.
-    /// If seq == head, the slot is ready to be written.
-    /// If seq == tail + 1, the slot is ready to be read.
-    sequence: AtomicU64,
-    data:     UnsafeCell<MaybeUninit<Arc<T>>>,
+struct State<T> {
+    buffer:       VecDeque<Arc<T>>,
+    // Each position is relative to the front of the buffer. This avoids
+    // unbounded sequence counters and their rollover hazards.
+    receivers:    [Option<usize>; MAX_RECEIVERS],
+    sender_count: usize,
 }
 
-/// Tracks the state of an individual consumer in the broadcast group.
-struct ReceiverState {
-    active: AtomicBool,
-    /// The specific read position of this receiver.
-    tail:   AtomicU64,
-    /// Waker for suspending the consumer when the queue is empty at its tail.
-    waker:  AtomicWaker,
+impl<T> State<T> {
+    fn has_receivers(&self) -> bool {
+        self.receivers.iter().any(Option::is_some)
+    }
+
+    fn reclaim(&mut self) -> SmallVec<[Arc<T>; 8]> {
+        let consumed = self
+            .receivers
+            .iter()
+            .flatten()
+            .copied()
+            .min()
+            .unwrap_or(self.buffer.len());
+        for position in self.receivers.iter_mut().flatten() {
+            *position -= consumed;
+        }
+        self.buffer.drain(.. consumed).collect()
+    }
 }
 
-/// Tracks the state of an individual producer.
-struct SenderState {
-    active: AtomicBool,
-    /// Waker for suspending the producer when the queue is full (head meets
-    /// slowest tail).
-    waker:  AtomicWaker,
-}
-
-/// The shared state allocated on the heap, referenced by all Senders and
-/// Receivers.
+/// Shared broadcast state. Access through sender and receiver handles.
 pub struct Shared<T> {
-    buffer:   Box<[Slot<T>]>,
-    capacity: u64,
-
-    /// The global write position. Claimed via Compare-And-Swap (CAS).
-    head: CachePadded<AtomicU64>,
-
-    receivers: Box<[CachePadded<ReceiverState>]>,
-    senders:   Box<[CachePadded<SenderState>]>,
-
-    closed:         AtomicBool,
-    sender_count:   AtomicUsize,
-    receiver_count: AtomicUsize,
+    state:    Mutex<State<T>>,
+    capacity: usize,
+    readable: Event,
+    writable: Event,
 }
 
-// SAFETY: The Shared structure explicitly handles internal mutability and
-// thread synchronization.
-unsafe impl<T: Send + Sync> Send for Shared<T> {}
-// SAFETY: all shared mutations use atomics and slot access is synchronized by
-// the per-slot sequence number.
-unsafe impl<T: Send + Sync> Sync for Shared<T> {}
-
-/// The transmitting half of the channel.
+/// A broadcast sender. Clones share the same bounded buffer.
 pub struct Sender<T> {
     shared: Arc<Shared<T>>,
-    id:     usize,
 }
 
-/// The receiving half of the channel.
+/// A broadcast receiver with its own position in the buffer.
+///
+/// Also implements [`Stream`]. A subscription starts with the next sent value.
 pub struct Receiver<T> {
-    shared: Arc<Shared<T>>,
-    id:     usize,
+    shared:   Arc<Shared<T>>,
+    id:       usize,
+    listener: Option<EventListener>,
 }
 
-/// Create a new bounded channel, returning the sender and receiver halves.
+// Pinning the handle does not pin the heap-allocated channel values.
+impl<T> Unpin for Receiver<T> {}
+
+/// Creates a bounded broadcast channel with one sender and one receiver.
+///
+/// Every receiver observes every value sent after its subscription. The slowest
+/// receiver applies backpressure. At most 128 senders and 128 receivers may be
+/// active at once.
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(capacity > 0, "capacity must be greater than zero");
-    let capacity_u64 = u64::try_from(capacity).expect("capacity does not fit in u64");
-
-    let mut buffer = Vec::with_capacity(capacity);
-    for _ in 0 .. capacity {
-        buffer.push(Slot {
-            sequence: AtomicU64::new(0),
-            data:     UnsafeCell::new(MaybeUninit::uninit()),
-        });
-    }
-
-    let mut receivers = Vec::with_capacity(MAX_RECEIVERS);
-    for _ in 0 .. MAX_RECEIVERS {
-        receivers.push(CachePadded::new(ReceiverState {
-            active: AtomicBool::new(false),
-            tail:   AtomicU64::new(u64::MAX),
-            waker:  AtomicWaker::new(),
-        }));
-    }
-
-    let mut senders = Vec::with_capacity(MAX_SENDERS);
-    for _ in 0 .. MAX_SENDERS {
-        senders.push(CachePadded::new(SenderState {
-            active: AtomicBool::new(false),
-            waker:  AtomicWaker::new(),
-        }));
-    }
-
+    let mut receivers = [None; MAX_RECEIVERS];
+    receivers[0] = Some(0);
     let shared = Arc::new(Shared {
-        buffer:         buffer.into_boxed_slice(),
-        capacity:       capacity_u64,
-        head:           CachePadded::new(AtomicU64::new(0)),
-        receivers:      receivers.into_boxed_slice(),
-        senders:        senders.into_boxed_slice(),
-        closed:         AtomicBool::new(false),
-        sender_count:   AtomicUsize::new(1),
-        receiver_count: AtomicUsize::new(1),
+        state: Mutex::new(State {
+            buffer: VecDeque::with_capacity(capacity),
+            receivers,
+            sender_count: 1,
+        }),
+        capacity,
+        readable: Event::new(),
+        writable: Event::new(),
     });
-
-    // Initialize the primary sender and receiver to index 0.
-    shared.senders[0].active.store(true, Ordering::Relaxed);
-    shared.receivers[0].active.store(true, Ordering::Relaxed);
-    shared.receivers[0].tail.store(0, Ordering::Relaxed);
-
     (
         Sender {
-            shared: shared.clone(),
-            id:     0,
+            shared: Arc::clone(&shared),
         },
         Receiver {
             shared,
             id: 0,
+            listener: None,
         },
     )
 }
 
 impl<T> Shared<T> {
-    /// Determine the slowest active receiver.
-    fn min_tail(&self) -> u64 {
-        let mut min = u64::MAX;
-        let mut any_active = false;
-        for rx in self.receivers.iter() {
-            if rx.active.load(Ordering::Acquire) {
-                any_active = true;
-                let t = rx.tail.load(Ordering::Acquire);
-                if t < min {
-                    min = t;
-                }
-            }
-        }
-        // If all receivers drop, advance min_tail to head so producers can freely
-        // overwrite/drop data.
-        if any_active {
-            min
-        } else {
-            self.head.load(Ordering::Relaxed)
-        }
-    }
-
-    fn wake_receivers(&self) {
-        for rx in self.receivers.iter() {
-            if rx.active.load(Ordering::Relaxed) {
-                rx.waker.wake();
-            }
-        }
-    }
-
-    fn wake_producers(&self) {
-        for tx in self.senders.iter() {
-            if tx.active.load(Ordering::Relaxed) {
-                tx.waker.wake();
-            }
-        }
-    }
-
-    /// Try to push a value into the channel without blocking.
+    /// Tries to send a value, returning it if full or without receivers.
     pub fn try_push(&self, value: T) -> Result<(), T> {
-        if self.receiver_count.load(Ordering::Acquire) == 0 {
-            return Err(value);
-        }
-        let cap = self.capacity;
-        let mut head = self.head.load(Ordering::Acquire);
-
-        loop {
-            // Check boundary: Head cannot wrap around past the slowest reader.
-            if head.wrapping_sub(self.min_tail()) >= cap {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.has_receivers() || state.buffer.len() == self.capacity {
                 return Err(value);
             }
-
-            // Attempt to claim the current head sequence.
-            match self
-                .head
-                .compare_exchange_weak(head, head + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
-                | Ok(_) => {
-                    let slot = &self.buffer[(head % self.capacity) as usize];
-                    // SAFETY: this producer exclusively claimed `head`, and
-                    // the capacity check proves every receiver has left the
-                    // previous value in this slot.
-                    unsafe {
-                        let arc = Arc::new(value);
-                        if head >= cap {
-                            // Safely drop the element from the previous wrap-around.
-                            // We know no receiver is reading this because head < min_tail + cap.
-                            drop((*slot.data.get()).assume_init_read());
-                        }
-                        (*slot.data.get()).write(arc);
-                    }
-                    // Release the slot to consumers by updating the sequence.
-                    slot.sequence.store(head + 1, Ordering::Release);
-                    self.wake_receivers();
-                    return Ok(());
-                },
-                | Err(actual) => head = actual, // CAS failed, retry with updated head
-            }
+            state.buffer.push_back(Arc::new(value));
         }
+        self.readable.notify(usize::MAX);
+        Ok(())
     }
 
-    /// Try to push multiple values into the channel without blocking.
+    /// Sends the prefix that fits, returning any unsent suffix.
+    /// Empty batches always succeed.
     pub fn try_push_many(&self, mut values: Vec<T>) -> Result<(), Vec<T>> {
-        if self.receiver_count.load(Ordering::Acquire) == 0 {
-            return Err(values);
+        if values.is_empty() {
+            return Ok(());
         }
-        let cap = self.capacity;
-        let mut head = self.head.load(Ordering::Acquire);
-
-        loop {
-            let avail = cap.saturating_sub(head.wrapping_sub(self.min_tail()));
-            if avail == 0 {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.has_receivers() {
                 return Err(values);
             }
-
-            // Claim contiguous sequence block up to available capacity
-            let claim = avail.min(values.len() as u64) as usize;
-
-            if self
-                .head
-                .compare_exchange_weak(head, head + claim as u64, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                for (i, val) in values.drain(.. claim).enumerate() {
-                    let curr_h = head + i as u64;
-                    let slot = &self.buffer[(curr_h % self.capacity) as usize];
-                    // SAFETY: this producer exclusively claimed `curr_h`, and
-                    // the capacity check proves the previous value is unused.
-                    unsafe {
-                        let arc = Arc::new(val);
-                        if curr_h >= cap {
-                            drop((*slot.data.get()).assume_init_read());
-                        }
-                        (*slot.data.get()).write(arc);
-                    }
-                    slot.sequence.store(curr_h + 1, Ordering::Release);
-                }
-                self.wake_receivers();
-
-                if values.is_empty() {
-                    return Ok(());
-                } else {
-                    return Err(values); // Return unpushed remainder
-                }
-            } else {
-                head = self.head.load(Ordering::Acquire);
-            }
+            let count = values.len().min(self.capacity - state.buffer.len());
+            state.buffer.extend(values.drain(.. count).map(Arc::new));
         }
-    }
-
-    /// Try to pop a value from the channel without blocking.
-    pub fn try_pop(&self, rx_id: usize) -> Option<Arc<T>> {
-        let rx = &self.receivers[rx_id];
-        let tail = rx.tail.load(Ordering::Relaxed);
-
-        let slot = &self.buffer[(tail % self.capacity) as usize];
-        let seq = slot.sequence.load(Ordering::Acquire);
-
-        // Sequence == tail + 1 means the producer has fully committed the write
-        if seq == tail + 1 {
-            // SAFETY: the matching sequence proves the producer committed a
-            // fully initialized `Arc`; advancing the tail happens afterwards.
-            let data = unsafe { (*slot.data.get()).assume_init_ref().clone() };
-            // Advance this receiver's individual tail
-            rx.tail.store(tail + 1, Ordering::Release);
-            self.wake_producers();
-            Some(data)
+        self.readable.notify(usize::MAX);
+        if values.is_empty() {
+            Ok(())
         } else {
-            None
+            Err(values)
         }
     }
 
-    /// Try to pop multiple values from the channel without blocking.
+    /// Tries to receive a value for a registered receiver ID.
+    pub fn try_pop(&self, rx_id: usize) -> Option<Arc<T>> {
+        let (value, retired) = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let position = state.receivers.get(rx_id).copied().flatten()?;
+            let value = Arc::clone(state.buffer.get(position)?);
+            state.receivers[rx_id] = Some(position + 1);
+            (value, state.reclaim())
+        };
+        self.writable.notify(usize::MAX);
+        // User destructors must run after committing state and releasing the lock.
+        drop(retired);
+        Some(value)
+    }
+
+    /// Tries to receive at most `max` values for a registered receiver ID.
     pub fn try_pop_many(&self, rx_id: usize, max: usize) -> Vec<Arc<T>> {
-        let mut results = Vec::with_capacity(max);
-        let rx = &self.receivers[rx_id];
-        let mut tail = rx.tail.load(Ordering::Relaxed);
-
-        // Fast-path contiguous reading without touching atomic tail on every item
-        for _ in 0 .. max {
-            let slot = &self.buffer[(tail % self.capacity) as usize];
-            if slot.sequence.load(Ordering::Acquire) == tail + 1 {
-                // SAFETY: the matching sequence proves this slot contains the
-                // committed value for `tail`.
-                results.push(unsafe { (*slot.data.get()).assume_init_ref().clone() });
-                tail += 1;
-            } else {
-                break;
-            }
-        }
-
-        if !results.is_empty() {
-            // Commit all read positions at once
-            rx.tail.store(tail, Ordering::Release);
-            self.wake_producers();
-        }
-        results
+        let (values, retired) = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(position) = state.receivers.get(rx_id).copied().flatten() else {
+                return Vec::new();
+            };
+            let count = max.min(state.buffer.len() - position);
+            let values = state.buffer.iter().skip(position).take(count).cloned().collect();
+            state.receivers[rx_id] = Some(position + count);
+            (values, state.reclaim())
+        };
+        self.writable.notify(usize::MAX);
+        drop(retired);
+        values
     }
 }
 
 impl<T> Sender<T> {
-    /// Attempts to push a value without waiting for capacity.
+    /// Tries to send a value, returning it if full or closed.
     pub fn try_push(&self, value: T) -> Result<(), T> {
         self.shared.try_push(value)
     }
 
-    /// Attempts to push values without waiting, returning the unpushed suffix.
+    /// Sends the prefix that fits, returning any unsent suffix.
     pub fn try_push_many(&self, values: Vec<T>) -> Result<(), Vec<T>> {
         self.shared.try_push_many(values)
     }
 
-    /// Attempts to create another producer handle.
-    ///
-    /// Returns `None` when the channel already has the maximum number of
-    /// simultaneously active senders.
+    /// Returns whether all receivers have been dropped.
+    pub fn is_closed(&self) -> bool {
+        !self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .has_receivers()
+    }
+
+    /// Creates another sender, or returns `None` at the sender limit.
     pub fn try_clone(&self) -> Option<Self> {
-        for (id, sender) in self.shared.senders.iter().enumerate() {
-            if sender
-                .active
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                self.shared.sender_count.fetch_add(1, Ordering::AcqRel);
-                return Some(Self {
-                    shared: Arc::clone(&self.shared),
-                    id,
-                });
+        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sender_count == MAX_SENDERS {
+            return None;
+        }
+        state.sender_count += 1;
+        Some(Self {
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// Sends a value, waiting for capacity. Returns the value if closed.
+    pub async fn push(&self, mut value: T) -> Result<(), T> {
+        loop {
+            // Each operation owns a listener: simultaneous sends on one handle
+            // cannot overwrite each other's wake registration.
+            let listener = self.shared.writable.listen();
+            match self.try_push(value) {
+                | Ok(()) => return Ok(()),
+                | Err(unsent) => value = unsent,
             }
+            if self.is_closed() {
+                return Err(value);
+            }
+            listener.await;
         }
-        None
     }
 
-    /// Push a value into the channel.
-    pub async fn push(&self, value: T) -> Result<(), T> {
-        PushFuture {
-            sender: self,
-            value:  Some(value),
+    /// Sends all values, returning the unsent suffix if closed.
+    /// Canceling this future leaves any already sent prefix in the channel.
+    pub async fn push_many(&self, mut values: Vec<T>) -> Result<(), Vec<T>> {
+        loop {
+            let listener = self.shared.writable.listen();
+            match self.try_push_many(values) {
+                | Ok(()) => return Ok(()),
+                | Err(unsent) => values = unsent,
+            }
+            if self.is_closed() {
+                return Err(values);
+            }
+            listener.await;
         }
-        .await
-    }
-
-    /// Push multiple values into the channel.
-    pub async fn push_many(&self, values: Vec<T>) -> Result<(), Vec<T>> {
-        PushManyFuture {
-            sender: self,
-            values: Some(values),
-        }
-        .await
     }
 }
 
 impl<T> Receiver<T> {
-    /// Creates a new receiver.
-    pub fn subscribe(&self) -> Option<Receiver<T>> {
-        for (id, rx) in self.shared.receivers.iter().enumerate() {
-            if !rx.active.load(Ordering::Acquire) {
-                // Claim the receiver slot
-                if rx
-                    .active
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    rx.tail
-                        .store(self.shared.head.load(Ordering::Acquire), Ordering::Release);
-                    self.shared.receiver_count.fetch_add(1, Ordering::AcqRel);
-                    return Some(Receiver {
-                        shared: self.shared.clone(),
-                        id,
-                    });
-                }
-            }
-        }
-        None // Max receivers reached
+    /// Subscribes to future values, or returns `None` at the receiver limit.
+    pub fn subscribe(&self) -> Option<Self> {
+        let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+        let id = state.receivers.iter().position(Option::is_none)?;
+        state.receivers[id] = Some(state.buffer.len());
+        Some(Self {
+            shared: Arc::clone(&self.shared),
+            id,
+            listener: None,
+        })
     }
 
-    /// Asynchronously pops a value from the channel.
+    /// Returns whether all senders have been dropped. Buffered values can
+    /// remain.
+    pub fn is_closed(&self) -> bool {
+        self.shared.state.lock().unwrap_or_else(|p| p.into_inner()).sender_count == 0
+    }
+
+    /// Receives a value without waiting, or returns `None` when empty.
+    pub fn try_pop(&mut self) -> Option<Arc<T>> {
+        self.shared.try_pop(self.id)
+    }
+
+    /// Receives up to `max` values without waiting.
+    pub fn try_pop_many(&mut self, max: usize) -> Vec<Arc<T>> {
+        self.shared.try_pop_many(self.id, max)
+    }
+
+    /// Receives a value, or `None` after closure and draining the buffer.
     pub async fn pop(&mut self) -> Option<Arc<T>> {
-        PopFuture {
-            receiver: self
-        }
-        .await
+        std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
 
-    /// Asynchronously pops multiple values from the channel.
+    /// Receives up to `max` values, waiting until at least one is available.
+    /// A zero limit returns immediately.
     pub async fn pop_many(&mut self, max: usize) -> Vec<Arc<T>> {
         if max == 0 {
             return Vec::new();
         }
-        PopManyFuture {
-            receiver: self,
-            max,
-        }
-        .await
+        let Some(first) = self.pop().await else {
+            return Vec::new();
+        };
+        let mut values = vec![first];
+        values.extend(self.try_pop_many(max - 1));
+        values
     }
 }
 
-struct PushFuture<'a, T> {
-    sender: &'a Sender<T>,
-    value:  Option<T>,
-}
+impl<T> Stream for Receiver<T> {
+    type Item = Arc<T>;
 
-impl<'a, T> Future for PushFuture<'a, T> {
-    type Output = Result<(), T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: Struct contains no structurally pinned fields. Unpin projection is
-        // safe.
-        // SAFETY: the future has no structurally pinned fields.
-        let this = unsafe { self.get_unchecked_mut() };
-        let val = this.value.take().expect("polled after ready");
-
-        match this.sender.shared.try_push(val) {
-            | Ok(_) => Poll::Ready(Ok(())),
-            | Err(v) => {
-                if this.sender.shared.closed.load(Ordering::Acquire) {
-                    return Poll::Ready(Err(v));
-                }
-                if this.sender.shared.receiver_count.load(Ordering::Acquire) == 0 {
-                    return Poll::Ready(Err(v));
-                }
-
-                // Register waker BEFORE re-checking condition to avoid lost wakeups
-                this.sender.shared.senders[this.sender.id].waker.register(cx.waker());
-
-                match this.sender.shared.try_push(v) {
-                    | Ok(_) => Poll::Ready(Ok(())),
-                    | Err(v_retry) => {
-                        this.value = Some(v_retry);
-                        Poll::Pending
-                    },
-                }
-            },
-        }
-    }
-}
-
-struct PushManyFuture<'a, T> {
-    sender: &'a Sender<T>,
-    values: Option<Vec<T>>,
-}
-
-impl<'a, T> Future for PushManyFuture<'a, T> {
-    type Output = Result<(), Vec<T>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: the future has no structurally pinned fields.
-        let this = unsafe { self.get_unchecked_mut() };
-        let vals = this.values.take().expect("polled after ready");
-
-        match this.sender.shared.try_push_many(vals) {
-            | Ok(_) => Poll::Ready(Ok(())),
-            | Err(rem) => {
-                if this.sender.shared.closed.load(Ordering::Acquire) {
-                    return Poll::Ready(Err(rem));
-                }
-                if this.sender.shared.receiver_count.load(Ordering::Acquire) == 0 {
-                    return Poll::Ready(Err(rem));
-                }
-
-                this.sender.shared.senders[this.sender.id].waker.register(cx.waker());
-
-                match this.sender.shared.try_push_many(rem) {
-                    | Ok(_) => Poll::Ready(Ok(())),
-                    | Err(rem_retry) => {
-                        this.values = Some(rem_retry);
-                        Poll::Pending
-                    },
-                }
-            },
-        }
-    }
-}
-
-struct PopFuture<'a, T> {
-    receiver: &'a Receiver<T>,
-}
-
-impl<'a, T> Future for PopFuture<'a, T> {
-    type Output = Option<Arc<T>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: the future has no structurally pinned fields.
-        let this = unsafe { self.get_unchecked_mut() };
-
-        if let Some(val) = this.receiver.shared.try_pop(this.receiver.id) {
-            return Poll::Ready(Some(val));
-        }
-
-        if this.receiver.shared.closed.load(Ordering::Acquire) {
-            return Poll::Ready(None);
-        }
-
-        this.receiver.shared.receivers[this.receiver.id]
-            .waker
-            .register(cx.waker());
-
-        if let Some(val) = this.receiver.shared.try_pop(this.receiver.id) {
-            Poll::Ready(Some(val))
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-struct PopManyFuture<'a, T> {
-    receiver: &'a Receiver<T>,
-    max:      usize,
-}
-
-impl<'a, T> Future for PopManyFuture<'a, T> {
-    type Output = Vec<Arc<T>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: the future has no structurally pinned fields.
-        let this = unsafe { self.get_unchecked_mut() };
-
-        let res = this.receiver.shared.try_pop_many(this.receiver.id, this.max);
-        if !res.is_empty() {
-            return Poll::Ready(res);
-        }
-
-        if this.receiver.shared.closed.load(Ordering::Acquire) {
-            return Poll::Ready(Vec::new());
-        }
-
-        this.receiver.shared.receivers[this.receiver.id]
-            .waker
-            .register(cx.waker());
-
-        let res = this.receiver.shared.try_pop_many(this.receiver.id, this.max);
-        if !res.is_empty() {
-            Poll::Ready(res)
-        } else {
-            Poll::Pending
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.listener.is_none() {
+                self.listener = Some(self.shared.readable.listen());
+            }
+            if let Some(value) = self.try_pop() {
+                self.listener = None;
+                return Poll::Ready(Some(value));
+            }
+            if self.is_closed() {
+                self.listener = None;
+                // Recheck after observing closure to include the final send.
+                return Poll::Ready(self.try_pop());
+            }
+            match Pin::new(self.listener.as_mut().expect("listener registered")).poll(cx) {
+                | Poll::Ready(()) => self.listener = None,
+                | Poll::Pending => return Poll::Pending,
+            }
         }
     }
 }
@@ -573,42 +327,26 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.shared.senders[self.id].active.store(false, Ordering::Release);
-        if self.shared.sender_count.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.shared.closed.store(true, Ordering::Release);
-            self.shared.wake_receivers();
+        let closed = {
+            let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.sender_count -= 1;
+            state.sender_count == 0
+        };
+        if closed {
+            self.shared.readable.notify(usize::MAX);
         }
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let rx = &self.shared.receivers[self.id];
-        rx.active.store(false, Ordering::Release);
-        // Advance out of bounds so this consumer no longer throttles min_tail
-        rx.tail.store(u64::MAX, Ordering::Release);
-        self.shared.receiver_count.fetch_sub(1, Ordering::AcqRel);
-        self.shared.wake_producers();
-    }
-}
-
-impl<T> Drop for Shared<T> {
-    fn drop(&mut self) {
-        let head = self.head.load(Ordering::Acquire);
-        let cap = self.capacity;
-        let start = head.saturating_sub(cap);
-
-        // Ensure remaining undropped inner Arc values are freed.
-        for i in start .. head {
-            let slot = &self.buffer[(i % self.capacity) as usize];
-            if slot.sequence.load(Ordering::Acquire) == i + 1 {
-                // SAFETY: `self` is being destroyed, so no handle can access
-                // the slots; the sequence check proves this slot is initialized.
-                unsafe {
-                    (*slot.data.get()).assume_init_drop();
-                }
-            }
-        }
+        let retired = {
+            let mut state = self.shared.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.receivers[self.id] = None;
+            state.reclaim()
+        };
+        self.shared.writable.notify(usize::MAX);
+        drop(retired);
     }
 }
 
@@ -858,5 +596,98 @@ mod tests {
         for t in recv_tasks {
             assert_eq!(t.await.unwrap(), expected_total);
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_sends_on_one_handle_keep_independent_wakers() {
+        use futures::{
+            StreamExt,
+            poll,
+            stream::FuturesUnordered,
+        };
+        let (tx, mut rx) = channel(1);
+        tx.push(0).await.unwrap();
+        let mut sends = (1 .. 4).map(|value| tx.push(value)).collect::<FuturesUnordered<_>>();
+        assert!(poll!(sends.next()).is_pending());
+        let collect = async {
+            let mut values = Vec::new();
+            for _ in 0 .. 4 {
+                values.push(*rx.pop().await.unwrap());
+            }
+            values
+        };
+        let send_all = async {
+            while let Some(result) = sends.next().await {
+                result.unwrap();
+            }
+        };
+        let (mut received, ()) = timeout(Duration::from_secs(2), async { tokio::join!(collect, send_all) })
+            .await
+            .unwrap();
+        received.sort();
+        assert_eq!(received, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn reused_subscription_starts_at_current_head() {
+        let (tx, mut original) = channel(2);
+        for value in 0 .. 50 {
+            let mut subscriber = original.subscribe().unwrap();
+            tx.try_push(value).unwrap();
+            assert_eq!(*subscriber.try_pop().unwrap(), value);
+            assert_eq!(*original.try_pop().unwrap(), value);
+            drop(subscriber);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_supports_non_unpin_values_and_drains_after_close() {
+        use std::marker::PhantomPinned;
+
+        use futures::StreamExt;
+        let (tx, mut rx) = channel(1);
+        assert!(tx.try_push((42, PhantomPinned)).is_ok());
+        drop(tx);
+        assert_eq!(rx.next().await.unwrap().0, 42);
+        assert!(rx.next().await.is_none());
+        assert!(rx.next().await.is_none());
+    }
+
+    #[test]
+    fn empty_batches_succeed_when_full_or_closed() {
+        let (tx, rx) = channel(1);
+        tx.try_push(1).unwrap();
+        assert_eq!(tx.try_push_many(vec![]), Ok(()));
+        drop(rx);
+        assert_eq!(tx.try_push_many(vec![]), Ok(()));
+    }
+
+    #[test]
+    fn subscriber_limit_recovers_after_drop() {
+        let (_tx, rx) = channel::<i32>(1);
+        let mut subscribers: Vec<_> = (1 .. MAX_RECEIVERS).map(|_| rx.subscribe().unwrap()).collect();
+        assert!(rx.subscribe().is_none());
+        subscribers.pop();
+        assert!(rx.subscribe().is_some());
+    }
+
+    #[test]
+    fn dropping_receiver_commits_state_before_running_destructors() {
+        use std::panic::{
+            AssertUnwindSafe,
+            catch_unwind,
+        };
+        struct Bomb(bool);
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                assert!(!self.0, "destructor panic");
+            }
+        }
+        let (tx, rx) = channel(1);
+        assert!(tx.try_push(Bomb(true)).is_ok());
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(rx))).is_err());
+        assert!(tx.is_closed());
+        assert!(tx.try_push(Bomb(false)).is_err());
+        drop(tx);
     }
 }

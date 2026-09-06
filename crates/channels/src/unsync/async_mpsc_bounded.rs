@@ -2,7 +2,6 @@
 
 use std::{
     cell::Cell,
-    // collections::VecDeque,
     future::poll_fn,
     rc::Rc,
     task::{
@@ -146,42 +145,22 @@ impl<T> Sender<T> {
         I: IntoIterator<Item = T>,
     {
         let mut iter = values.into_iter();
-
-        if self.shared.closed.get() {
-            return Err(TryPushManyError::Closed(iter.collect()));
-        }
-
-        let mut q: SmallVec<[T; 32]> = match self.shared.queue.take() {
-            | Some(q) => q,
-            | None => return Err(TryPushManyError::Closed(iter.collect())),
-        };
-
-        let mut pushed_any = false;
-
-        // Fill exact remaining capacity
-        while q.len() < self.shared.capacity {
-            if let Some(val) = iter.next() {
-                q.push(val);
-                pushed_any = true;
-            } else {
-                break;
+        while let Some(value) = iter.next() {
+            match self.try_push(value) {
+                | Ok(()) => {},
+                | Err(TryPushError::Full(value)) => {
+                    let mut remainder = vec![value];
+                    remainder.extend(iter);
+                    return Err(TryPushManyError::Full(remainder));
+                },
+                | Err(TryPushError::Closed(value)) => {
+                    let mut remainder = vec![value];
+                    remainder.extend(iter);
+                    return Err(TryPushManyError::Closed(remainder));
+                },
             }
         }
-
-        self.shared.queue.set(Some(q));
-
-        if pushed_any {
-            if let Some(waker) = self.shared.rx_waker.take() {
-                waker.wake();
-            }
-        }
-
-        let remainder: Vec<T> = iter.collect();
-        if remainder.is_empty() {
-            Ok(())
-        } else {
-            Err(TryPushManyError::Full(remainder))
-        }
+        Ok(())
     }
 
     /// Push multiple values into the channel.
@@ -456,5 +435,36 @@ mod tests {
         assert!(poll!(pending.as_mut()).is_pending());
         drop(pending);
         assert!(tx.shared.tx_wakers.take().is_empty());
+    }
+
+    #[test]
+    fn panicking_batch_iterator_preserves_buffer() {
+        use std::panic::{
+            AssertUnwindSafe,
+            catch_unwind,
+        };
+        let (tx, mut rx) = channel(3);
+        tx.try_push(0).unwrap();
+        let mut next = 0;
+        let values = std::iter::from_fn(|| {
+            next += 1;
+            assert!(next != 2, "iterator panic");
+            Some(next)
+        });
+        assert!(catch_unwind(AssertUnwindSafe(|| tx.try_push_many(values))).is_err());
+        assert_eq!(rx.try_pop_many(3), Ok(vec![0, 1]));
+        tx.try_push(2).unwrap();
+        assert_eq!(rx.try_pop(), Ok(2));
+    }
+
+    #[test]
+    fn batch_iterator_can_reenter_sender() {
+        let (tx, mut rx) = channel(3);
+        let values = std::iter::once_with(|| {
+            tx.try_push(1).unwrap();
+            2
+        });
+        tx.try_push_many(values).unwrap();
+        assert_eq!(rx.try_pop_many(3), Ok(vec![1, 2]));
     }
 }

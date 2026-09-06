@@ -1,7 +1,7 @@
 [package]
 name                 = "xiaoyong-channels"
 description          = "Thread-safe and single-threaded asynchronous channel primitives"
-version              = "2.0.0"
+version              = "3.0.0"
 publish.workspace    = true
 authors.workspace    = true
 repository.workspace = true
@@ -21,3 +21,4 @@ triomphe.workspace        = true
 futures.workspace         = true
 crossbeam-utils.workspace = true
 smallvec.workspace        = true
+event-listener.workspace = true
