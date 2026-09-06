@@ -62,8 +62,8 @@ impl<T> ArcSwap<T> {
         old
     }
 
-    /// Returns a future that resolves with the first snapshot stored after
-    /// this call.
+    /// Returns a future that waits for a change after this call and then loads
+    /// the current snapshot. Multiple intervening changes may be coalesced.
     #[must_use]
     pub fn wait_until_changed(&self) -> WaitUntilChanged<'_, T> {
         let start_version = self.version.load(Ordering::Acquire);

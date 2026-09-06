@@ -54,7 +54,31 @@ impl<T> RwLock<T> {
     }
 }
 
+impl<T> RwLock<T> {
+    /// Consumes the lock and returns its value without locking.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+}
+
+impl<T: Default> Default for RwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> From<T> for RwLock<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
 impl<T: ?Sized> RwLock<T> {
+    /// Returns mutable access without locking, using the exclusive borrow.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// Get a raw pointer to the underlying data.
     pub fn value_ptr(&self) -> *mut T {
         self.value.get()
@@ -83,6 +107,7 @@ impl<T: ?Sized> RwLock<T> {
         let writer_is_waiting = queue.iter().any(|(_, kind, _)| *kind == WaiterType::Write);
         self.waiters.set(queue);
         if s != WRITE_LOCKED && !writer_is_waiting {
+            assert!(s < WRITE_LOCKED - 1, "maximum number of readers exceeded");
             self.state.set(s + 1);
             Some(RwLockReadGuard {
                 lock: self
@@ -94,7 +119,10 @@ impl<T: ?Sized> RwLock<T> {
 
     /// Attempts to acquire the lock for writing without blocking.
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        if self.state.get() == UNLOCKED {
+        let queue = self.waiters.take();
+        let has_waiters = !queue.is_empty();
+        self.waiters.set(queue);
+        if self.state.get() == UNLOCKED && !has_waiters {
             self.state.set(WRITE_LOCKED);
             Some(RwLockWriteGuard {
                 lock: self
@@ -109,22 +137,24 @@ impl<T: ?Sized> RwLock<T> {
     fn wake_next(&self) {
         let queue = self.waiters.take();
 
-        match queue.first() {
-            | Some((_, WaiterType::Write, waker)) => {
-                waker.wake_by_ref();
+        let wakers = match queue.first() {
+            | Some((_, WaiterType::Write, waker)) if self.state.get() == UNLOCKED => {
+                smallvec::smallvec![waker.clone()]
             },
-            | _ => {
-                for (_, typ, waker) in queue.iter() {
-                    if *typ == WaiterType::Read {
-                        waker.wake_by_ref();
-                    } else {
-                        break;
-                    }
-                }
+            | Some((_, WaiterType::Read, _)) if self.state.get() != WRITE_LOCKED => {
+                queue
+                    .iter()
+                    .take_while(|(_, kind, _)| *kind == WaiterType::Read)
+                    .map(|(_, _, waker)| waker.clone())
+                    .collect::<SmallVec<[Waker; 8]>>()
             },
-        }
-
+            | _ => SmallVec::new(),
+        };
         self.waiters.set(queue);
+        // Restore the queue before invoking user-provided wake callbacks.
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -156,6 +186,7 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
             .any(|(_, typ, _)| *typ == WaiterType::Write);
 
         if s != WRITE_LOCKED && !has_writer_ahead {
+            assert!(s < WRITE_LOCKED - 1, "maximum number of readers exceeded");
             self.lock.state.set(s + 1);
             queue.retain(|(i, ..)| *i != id);
             self.lock.waiters.set(queue);
@@ -190,7 +221,7 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
             self.lock.waiters.set(queue);
 
             // Pass the baton if we were blocking a wakeup chain
-            if was_first && self.lock.state.get() == UNLOCKED {
+            if was_first {
                 self.lock.wake_next();
             }
         }
@@ -253,7 +284,7 @@ impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
             queue.retain(|(i, ..)| *i != id);
             self.lock.waiters.set(queue);
 
-            if was_first && self.lock.state.get() == UNLOCKED {
+            if was_first {
                 self.lock.wake_next();
             }
         }
@@ -339,5 +370,59 @@ mod tests {
                 assert_eq!(*guard, 42);
             })
             .await;
+    }
+
+    #[test]
+    fn canceling_writer_wakes_readers_while_a_reader_is_held() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{
+                    AtomicUsize,
+                    Ordering,
+                },
+            },
+            task::Wake,
+        };
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let lock = RwLock::new(42);
+        let held = lock.try_read().unwrap();
+        let mut writer = Box::pin(lock.write());
+        let mut reader = Box::pin(lock.read());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(writer.as_mut().poll(&mut cx).is_pending());
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut reader_cx = Context::from_waker(&waker);
+        assert!(reader.as_mut().poll(&mut reader_cx).is_pending());
+        drop(writer);
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert!(reader.as_mut().poll(&mut reader_cx).is_ready());
+        assert_eq!(*held, 42);
+    }
+
+    #[test]
+    fn try_write_respects_queued_writer() {
+        let lock = RwLock::new(0);
+        let held = lock.try_write().unwrap();
+        let mut queued = Box::pin(lock.write());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(queued.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(lock.try_write().is_none());
+        assert!(queued.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn exclusive_access_supports_unsized_values() {
+        let mut lock = RwLock::from([1, 2, 3]);
+        let unsized_lock: &mut RwLock<[i32]> = &mut lock;
+        unsized_lock.get_mut()[1] = 20;
+        assert_eq!(lock.into_inner(), [1, 20, 3]);
     }
 }

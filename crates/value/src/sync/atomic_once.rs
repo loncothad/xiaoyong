@@ -9,8 +9,8 @@ use std::sync::atomic::{
 /// Lock-free, single-assignment cell.
 ///
 /// Allows multiple threads to race to initialize a value. The
-/// winning thread stores its value, while losing threads silently discard their
-/// work.
+/// winning thread stores its value, while losing threads receive their owned
+/// candidate back together with a reference to the winning value.
 pub struct AtomicOnce<T> {
     ptr: AtomicPtr<T>,
 }
@@ -59,6 +59,25 @@ impl<T> AtomicOnce<T> {
             // from Box::into_raw. It is never mutated after initialization,
             // and lives until the AtomicOnce is dropped.
             Some(unsafe { &*p })
+        }
+    }
+
+    /// Returns exclusive access to the initialized value, if present.
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        let pointer = *self.ptr.get_mut();
+        // SAFETY: an exclusive borrow prevents readers or initializers, and a
+        // non-null pointer represents the Box owned by this cell.
+        unsafe { pointer.as_mut() }
+    }
+
+    /// Removes the initialized value, leaving the cell empty for reuse.
+    pub fn take(&mut self) -> Option<T> {
+        let pointer = core::mem::replace(self.ptr.get_mut(), ptr::null_mut());
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: exclusive access transfers the cell's sole Box ownership.
+            Some(*unsafe { Box::from_raw(pointer) })
         }
     }
 
@@ -148,23 +167,19 @@ impl<T> AtomicOnce<T> {
 
     /// Consumes the `AtomicOnce`, returning the inner value if initialized.
     pub fn into_inner(mut self) -> Option<T> {
-        // Bypass atomics since we have an exclusive mutable reference.
-        let p = *self.ptr.get_mut();
-        if p.is_null() {
-            None
-        } else {
-            // Set the pointer to null so `Drop` doesn't double-free.
-            *self.ptr.get_mut() = ptr::null_mut();
-
-            // SAFETY: The pointer was valid, and we now take ownership.
-            Some(*unsafe { Box::from_raw(p) })
-        }
+        self.take()
     }
 }
 
 impl<T> Default for AtomicOnce<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T> From<T> for AtomicOnce<T> {
+    fn from(value: T) -> Self {
+        Self::new_initialized(Box::new(value))
     }
 }
 
@@ -209,5 +224,16 @@ mod tests {
 
         let (value, doubled) = once.get().copied().expect("one thread must initialize the cell");
         assert_eq!(doubled, value * 2);
+    }
+
+    #[test]
+    fn exclusive_access_can_take_and_reinitialize() {
+        let mut once = AtomicOnce::from(String::from("old"));
+        once.get_mut().unwrap().push_str(" value");
+        assert_eq!(once.take().as_deref(), Some("old value"));
+        assert!(once.get_mut().is_none());
+        assert!(once.take().is_none());
+        assert!(once.init(Box::new(String::from("new"))).is_ok());
+        assert_eq!(once.into_inner().as_deref(), Some("new"));
     }
 }

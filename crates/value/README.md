@@ -49,3 +49,13 @@ Enables both `sync::arcswap` and `sync::async_arcswap`. This feature is disabled
 by default because these modules use the external `triomphe::Arc` type rather
 than `std::sync::Arc`; the asynchronous variant additionally uses
 `event-listener`.
+
+The single-threaded mutex and reader-writer lock implement `Default` and
+`From<T>`. Both offer `get_mut` for exclusive access without locking and
+`into_inner` to recover the value. Queued lock requests retain FIFO priority,
+including when a waiting writer is canceled while readers remain active.
+
+`AtomicOnce` implements `From<T>`, provides exclusive `get_mut`, and supports
+`take` to leave an empty cell that can be initialized again. Asynchronous swap
+waiters return the current snapshot after observing a change; intermediate
+snapshots may be coalesced.

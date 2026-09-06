@@ -43,7 +43,31 @@ impl<T> Mutex<T> {
     }
 }
 
+impl<T> Mutex<T> {
+    /// Consumes the lock and returns its value without locking.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+}
+
+impl<T: Default> Default for Mutex<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> From<T> for Mutex<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
 impl<T: ?Sized> Mutex<T> {
+    /// Returns mutable access without locking, using the exclusive borrow.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// Get a raw pointer to the underlying data.
     pub fn value_ptr(&self) -> *mut T {
         self.value.get()
@@ -140,14 +164,15 @@ impl<'a, T: ?Sized> Drop for LockFuture<'a, T> {
             // Remove this specific future from the wait queue
             queue.retain(|(w_id, _)| *w_id != id);
 
-            // Prevent Lost Wakeups
-            if !self.mutex.is_locked.get() {
-                if let Some((_, next_waker)) = queue.first() {
-                    next_waker.wake_by_ref();
-                }
-            }
-
+            let next_waker = if !self.mutex.is_locked.get() {
+                queue.first().map(|(_, waker)| waker.clone())
+            } else {
+                None
+            };
             self.mutex.waiters.set(queue);
+            if let Some(waker) = next_waker {
+                waker.wake();
+            }
         }
     }
 }
@@ -214,5 +239,32 @@ mod tests {
                 assert_eq!(*guard, 1);
             })
             .await;
+    }
+
+    #[test]
+    fn canceling_front_waiter_preserves_fifo_progress() {
+        let lock = Mutex::from(42);
+        let held = lock.try_lock().unwrap();
+        let mut first = Box::pin(lock.lock());
+        let mut second = Box::pin(lock.lock());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        drop(held);
+        assert!(lock.try_lock().is_none());
+        drop(first);
+        let second_guard = match second.as_mut().poll(&mut cx) {
+            | Poll::Ready(guard) => guard,
+            | _ => panic!("next waiter should acquire"),
+        };
+        assert_eq!(*second_guard, 42);
+    }
+
+    #[test]
+    fn exclusive_access_supports_unsized_values() {
+        let mut lock = Mutex::from([1, 2, 3]);
+        let unsized_lock: &mut Mutex<[i32]> = &mut lock;
+        unsized_lock.get_mut()[1] = 20;
+        assert_eq!(lock.into_inner(), [1, 20, 3]);
     }
 }
