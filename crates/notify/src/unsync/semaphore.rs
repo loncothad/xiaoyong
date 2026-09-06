@@ -16,7 +16,7 @@ use smallvec::SmallVec;
 struct Waiter {
     id:     usize,
     amount: usize,
-    waker:  Waker,
+    waker:  Option<Waker>,
 }
 
 struct Inner {
@@ -108,8 +108,12 @@ impl Semaphore {
                 return Poll::Ready(());
             }
             let waiter = &mut inner.waiters[index];
-            if !waiter.waker.will_wake(context.waker()) {
-                let old = std::mem::replace(&mut waiter.waker, waker);
+            if waiter
+                .waker
+                .as_ref()
+                .is_none_or(|registered| !registered.will_wake(context.waker()))
+            {
+                let old = waiter.waker.replace(waker);
                 drop(inner);
                 drop(old);
             }
@@ -126,7 +130,7 @@ impl Semaphore {
         inner.waiters.push(Waiter {
             id,
             amount,
-            waker,
+            waker: Some(waker),
         });
         *waiter_id = Some(id);
         Poll::Pending
@@ -145,12 +149,13 @@ impl Semaphore {
 
     fn wake_next(&self) {
         let waker = {
-            let inner = self.inner.borrow();
+            let mut inner = self.inner.borrow_mut();
+            let permits = inner.permits;
             inner
                 .waiters
-                .first()
-                .filter(|waiter| inner.permits >= waiter.amount)
-                .map(|waiter| waiter.waker.clone())
+                .first_mut()
+                .filter(|waiter| permits >= waiter.amount)
+                .and_then(|waiter| waiter.waker.take())
         };
         if let Some(waker) = waker {
             waker.wake();

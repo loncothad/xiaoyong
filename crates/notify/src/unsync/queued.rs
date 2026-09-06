@@ -1,7 +1,7 @@
 //! Single-threaded notification primitive with queued permits.
 
 use std::{
-    cell::Cell,
+    cell::RefCell,
     pin::Pin,
     rc::Rc,
     task::{
@@ -33,7 +33,7 @@ struct Inner {
 /// permits. Once waiters are registered, notifications are assigned in FIFO
 /// order and cannot be stolen by a newer waiter.
 pub struct Notify {
-    inner: Cell<Inner>,
+    inner: RefCell<Inner>,
 }
 
 impl Notify {
@@ -41,7 +41,7 @@ impl Notify {
     #[must_use]
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
-            inner: Cell::new(Inner {
+            inner: RefCell::new(Inner {
                 permits: 0,
                 next_id: 0,
                 waiters: SmallVec::new(),
@@ -51,7 +51,7 @@ impl Notify {
 
     /// Delivers one notification to the oldest waiter, or queues a permit.
     pub fn notify_one(&self) {
-        let mut inner = self.inner.take();
+        let mut inner = self.inner.borrow_mut();
         let waker = if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| !waiter.notified) {
             waiter.notified = true;
             waiter.transferable = true;
@@ -60,7 +60,7 @@ impl Notify {
             inner.permits = inner.permits.saturating_add(1);
             None
         };
-        self.inner.set(inner);
+        drop(inner);
 
         if let Some(waker) = waker {
             waker.wake();
@@ -71,7 +71,7 @@ impl Notify {
     ///
     /// This method does not store a permit when there are no waiters.
     pub fn notify_waiters(&self) {
-        let mut inner = self.inner.take();
+        let mut inner = self.inner.borrow_mut();
         let mut wakers = SmallVec::<[Waker; 8]>::new();
         for waiter in &mut inner.waiters {
             waiter.notified = true;
@@ -79,7 +79,7 @@ impl Notify {
                 wakers.push(waker);
             }
         }
-        self.inner.set(inner);
+        drop(inner);
 
         for waker in wakers {
             waker.wake();
@@ -116,14 +116,17 @@ impl Future for NotifiedFuture {
             return Poll::Ready(());
         }
 
-        let mut inner = self.notify.inner.take();
+        let waker = context.waker().clone();
+        let notify = Rc::clone(&self.notify);
+        let mut inner = notify.inner.borrow_mut();
         if let Some(id) = self.id {
             if let Some(index) = inner.waiters.iter().position(|waiter| waiter.id == id) {
                 if inner.waiters[index].notified {
-                    inner.waiters.remove(index);
+                    let removed = inner.waiters.remove(index);
                     self.id = None;
                     self.completed = true;
-                    self.notify.inner.set(inner);
+                    drop(inner);
+                    drop(removed);
                     return Poll::Ready(());
                 }
 
@@ -133,9 +136,12 @@ impl Future for NotifiedFuture {
                     .as_ref()
                     .is_none_or(|waker| !waker.will_wake(context.waker()))
                 {
-                    waiter.waker = Some(context.waker().clone());
+                    let old = waiter.waker.replace(waker);
+                    drop(inner);
+                    drop(old);
+                } else {
+                    drop(inner);
                 }
-                self.notify.inner.set(inner);
                 return Poll::Pending;
             }
         }
@@ -143,7 +149,7 @@ impl Future for NotifiedFuture {
         if inner.permits > 0 {
             inner.permits -= 1;
             self.completed = true;
-            self.notify.inner.set(inner);
+            drop(inner);
             return Poll::Ready(());
         }
 
@@ -153,10 +159,10 @@ impl Future for NotifiedFuture {
             id,
             notified: false,
             transferable: false,
-            waker: Some(context.waker().clone()),
+            waker: Some(waker),
         });
         self.id = Some(id);
-        self.notify.inner.set(inner);
+        drop(inner);
         Poll::Pending
     }
 }
@@ -164,13 +170,13 @@ impl Future for NotifiedFuture {
 impl Drop for NotifiedFuture {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            let mut inner = self.notify.inner.take();
+            let mut inner = self.notify.inner.borrow_mut();
             let removed = inner
                 .waiters
                 .iter()
                 .position(|waiter| waiter.id == id)
                 .map(|index| inner.waiters.remove(index));
-            self.notify.inner.set(inner);
+            drop(inner);
             if removed.as_ref().is_some_and(|waiter| waiter.transferable) {
                 self.notify.notify_one();
             }

@@ -76,6 +76,7 @@ impl<'a> Future for WaitFuture<'a> {
             return Poll::Ready(());
         }
 
+        let new_waker = cx.waker().clone();
         let mut waiters = self
             .notify
             .waiters
@@ -87,16 +88,16 @@ impl<'a> Future for WaitFuture<'a> {
             return Poll::Ready(());
         }
 
-        if let Some(idx) = self.index {
-            waiters[idx] = Some(cx.waker().clone());
-        } else if let Some(idx) = waiters.iter().position(|w| w.is_none()) {
-            waiters[idx] = Some(cx.waker().clone());
-            self.index = Some(idx);
-        } else {
-            let idx = waiters.len();
-            waiters.push(Some(cx.waker().clone()));
-            self.index = Some(idx);
-        }
+        let index = self.index.unwrap_or_else(|| {
+            waiters.iter().position(Option::is_none).unwrap_or_else(|| {
+                waiters.push(None);
+                waiters.len() - 1
+            })
+        });
+        let old_waker = waiters[index].replace(new_waker);
+        self.index = Some(index);
+        drop(waiters);
+        drop(old_waker);
 
         Poll::Pending
     }
@@ -111,9 +112,9 @@ impl<'a> Drop for WaitFuture<'a> {
                     .waiters
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if idx < waiters.len() {
-                    waiters[idx] = None;
-                }
+                let old_waker = waiters.get_mut(idx).and_then(Option::take);
+                drop(waiters);
+                drop(old_waker);
             }
         }
     }
@@ -161,5 +162,30 @@ mod tests {
 
         t1.await.unwrap();
         t2.await.unwrap();
+    }
+
+    #[test]
+    fn replaced_waker_can_reenter_notification_on_drop() {
+        use std::task::Wake;
+        struct FireOnDrop(Arc<Notify>);
+        impl Wake for FireOnDrop {
+            fn wake(self: Arc<Self>) {
+                self.0.fire();
+            }
+        }
+        impl Drop for FireOnDrop {
+            fn drop(&mut self) {
+                assert!(self.0.waiters.try_lock().is_ok(), "state still locked during callback");
+                self.0.fire();
+            }
+        }
+        let notify = Arc::new(Notify::new());
+        let waker = Waker::from(Arc::new(FireOnDrop(Arc::clone(&notify))));
+        let mut future = Box::pin(notify.wait());
+        assert!(future.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        drop(waker);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert!(future.as_mut().poll(&mut cx).is_ready());
     }
 }

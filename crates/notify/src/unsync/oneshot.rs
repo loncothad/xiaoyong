@@ -66,18 +66,21 @@ impl Future for WaitFuture {
             return Poll::Ready(());
         }
 
-        let mut waiters = self.notify.waiters.take();
-        if let Some(idx) = self.index {
-            waiters[idx] = Some(cx.waker().clone());
-        } else if let Some(idx) = waiters.iter().position(|w| w.is_none()) {
-            waiters[idx] = Some(cx.waker().clone());
-            self.index = Some(idx);
-        } else {
-            let idx = waiters.len();
-            waiters.push(Some(cx.waker().clone()));
-            self.index = Some(idx);
+        let new_waker = cx.waker().clone();
+        if self.notify.fired.get() {
+            return Poll::Ready(());
         }
+        let mut waiters = self.notify.waiters.take();
+        let index = self.index.unwrap_or_else(|| {
+            waiters.iter().position(Option::is_none).unwrap_or_else(|| {
+                waiters.push(None);
+                waiters.len() - 1
+            })
+        });
+        let old_waker = waiters[index].replace(new_waker);
+        self.index = Some(index);
         self.notify.waiters.set(waiters);
+        drop(old_waker);
 
         Poll::Pending
     }
@@ -89,10 +92,9 @@ impl Drop for WaitFuture {
             // Only clean up if it hasn't fired (if fired, arena is already consumed)
             if !self.notify.fired.get() {
                 let mut waiters = self.notify.waiters.take();
-                if idx < waiters.len() {
-                    waiters[idx] = None;
-                }
+                let old_waker = waiters.get_mut(idx).and_then(Option::take);
                 self.notify.waiters.set(waiters);
+                drop(old_waker);
             }
         }
     }

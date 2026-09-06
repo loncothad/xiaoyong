@@ -149,52 +149,28 @@ impl<T> Future for Receiver<T> {
     type Output = Result<T, Canceled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // A waker's clone callback can send or cancel the channel. Run it
+        // before reading the state so that change cannot be missed.
+        let new_waker = cx.waker().clone();
         let state_ptr = self.inner.get();
-
-        let old_waker: Option<Waker>;
-
-        // SAFETY: the channel is single-threaded. No external code runs while
-        // the state is mutably inspected or replaced.
+        let old_waker;
+        // SAFETY: the channel is single-threaded. No user code runs while
+        // inspecting or replacing the state, and old wakers drop afterwards.
         unsafe {
-            let state = &mut *state_ptr;
-            match state {
+            match &mut *state_ptr {
                 | State::Complete(_) => {
-                    // Extract value and set to Canceled to avoid re-polling issues.
-                    if let State::Complete(val) = ptr::replace(state_ptr, State::Canceled) {
-                        return Poll::Ready(Ok(val));
+                    if let State::Complete(value) = ptr::replace(state_ptr, State::Canceled) {
+                        return Poll::Ready(Ok(value));
                     }
                     unreachable!()
                 },
                 | State::Canceled => return Poll::Ready(Err(Canceled)),
                 | State::Incomplete {
                     waker,
-                } => {
-                    // Take ownership of the waker to evaluate `will_wake` safely outside the
-                    // borrow.
-                    old_waker = waker.take();
-                },
+                } => old_waker = waker.replace(new_waker),
             }
         }
-
-        // Evaluate waker (safe from re-entrancy UB).
-        let new_waker = cx.waker();
-        let waker_to_store = match old_waker {
-            | Some(w) if w.will_wake(new_waker) => w,
-            | _ => new_waker.clone(),
-        };
-
-        // SAFETY: the channel is single-threaded, and the prior mutable borrow
-        // ended before `will_wake` or cloning could invoke external behavior.
-        unsafe {
-            let state = &mut *state_ptr;
-            if let State::Incomplete {
-                waker,
-            } = state
-            {
-                *waker = Some(waker_to_store);
-            }
-        }
-
+        drop(old_waker);
         Poll::Pending
     }
 }
@@ -232,5 +208,42 @@ mod tests {
                 assert_eq!(val, 42);
             })
             .await;
+    }
+
+    #[test]
+    fn send_during_waker_clone_is_observed() {
+        use std::{
+            cell::RefCell,
+            task::{
+                RawWaker,
+                RawWakerVTable,
+            },
+        };
+        thread_local! {
+            static ON_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+        fn raw_waker() -> RawWaker {
+            fn clone(_: *const ()) -> RawWaker {
+                let callback = ON_CLONE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+                raw_waker()
+            }
+            fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        let (sender, mut receiver) = channel();
+        ON_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                sender.send(42).unwrap();
+            }))
+        });
+        // SAFETY: the static vtable never dereferences its null data, owns no
+        // resources, and accesses callbacks only through thread-local storage.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut receiver).poll(&mut cx), Poll::Ready(Ok(42)));
     }
 }
