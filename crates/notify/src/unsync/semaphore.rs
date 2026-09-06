@@ -1,7 +1,7 @@
 //! Single-threaded asynchronous semaphore for limiting concurrent access.
 
 use std::{
-    cell::UnsafeCell,
+    cell::RefCell,
     pin::Pin,
     rc::Rc,
     task::{
@@ -30,7 +30,7 @@ struct Inner {
 /// Requests are served in FIFO order. A request for multiple permits therefore
 /// cannot be starved by newer one-permit requests.
 pub struct Semaphore {
-    inner: UnsafeCell<Inner>,
+    inner: RefCell<Inner>,
 }
 
 impl Semaphore {
@@ -38,7 +38,7 @@ impl Semaphore {
     #[must_use]
     pub fn new(permits: usize) -> Self {
         Self {
-            inner: UnsafeCell::new(Inner {
+            inner: RefCell::new(Inner {
                 permits,
                 next_id: 0,
                 waiters: SmallVec::new(),
@@ -85,15 +85,12 @@ impl Semaphore {
     /// Returns the current number of unclaimed permits.
     #[must_use]
     pub fn available_permits(&self) -> usize {
-        // SAFETY: `Semaphore` is `!Sync`, and all access is confined to one
-        // thread. No reference into `Inner` escapes this method.
-        unsafe { (*self.inner.get()).permits }
+        self.inner.borrow().permits
     }
 
     fn poll_acquire(&self, amount: usize, waiter_id: &mut Option<usize>, context: &mut Context<'_>) -> Poll<()> {
-        // SAFETY: `Semaphore` is `!Sync`, and the mutable borrow remains scoped
-        // to this method. Wakers are cloned but never invoked while borrowed.
-        let inner = unsafe { &mut *self.inner.get() };
+        let waker = context.waker().clone();
+        let mut inner = self.inner.borrow_mut();
 
         if let Some(id) = *waiter_id {
             let index = inner
@@ -103,13 +100,18 @@ impl Semaphore {
                 .expect("registered semaphore waiter disappeared");
             if index == 0 && inner.permits >= amount {
                 inner.permits -= amount;
-                inner.waiters.remove(0);
+                let removed = inner.waiters.remove(0);
                 *waiter_id = None;
+                drop(inner);
+                drop(removed);
+                self.wake_next();
                 return Poll::Ready(());
             }
             let waiter = &mut inner.waiters[index];
             if !waiter.waker.will_wake(context.waker()) {
-                waiter.waker = context.waker().clone();
+                let old = std::mem::replace(&mut waiter.waker, waker);
+                drop(inner);
+                drop(old);
             }
             return Poll::Pending;
         }
@@ -124,43 +126,48 @@ impl Semaphore {
         inner.waiters.push(Waiter {
             id,
             amount,
-            waker: context.waker().clone(),
+            waker,
         });
         *waiter_id = Some(id);
         Poll::Pending
     }
 
     fn release(&self, amount: usize) {
-        // SAFETY: see `poll_acquire`.
-        let inner = unsafe { &mut *self.inner.get() };
-        inner.permits = inner
-            .permits
-            .checked_add(amount)
-            .expect("semaphore permit count overflowed");
-        let waker = inner
-            .waiters
-            .first()
-            .filter(|waiter| inner.permits >= waiter.amount)
-            .map(|waiter| waiter.waker.clone());
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.permits = inner
+                .permits
+                .checked_add(amount)
+                .expect("semaphore permit count overflowed");
+        }
+        self.wake_next();
+    }
 
+    fn wake_next(&self) {
+        let waker = {
+            let inner = self.inner.borrow();
+            inner
+                .waiters
+                .first()
+                .filter(|waiter| inner.permits >= waiter.amount)
+                .map(|waiter| waiter.waker.clone())
+        };
         if let Some(waker) = waker {
             waker.wake();
         }
     }
 
     fn cancel(&self, id: usize) {
-        // SAFETY: see `poll_acquire`.
-        let inner = unsafe { &mut *self.inner.get() };
-        let was_first = inner.waiters.first().is_some_and(|waiter| waiter.id == id);
-        inner.waiters.retain(|waiter| waiter.id != id);
-        let waker = was_first
-            .then(|| inner.waiters.first())
-            .flatten()
-            .filter(|waiter| inner.permits >= waiter.amount)
-            .map(|waiter| waiter.waker.clone());
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        let removed = {
+            let mut inner = self.inner.borrow_mut();
+            inner
+                .waiters
+                .iter()
+                .position(|waiter| waiter.id == id)
+                .map(|index| inner.waiters.remove(index))
+        };
+        drop(removed);
+        self.wake_next();
     }
 }
 
@@ -288,5 +295,46 @@ mod tests {
         assert!(poll!(second.as_mut()).is_pending());
         drop(first);
         assert!(poll!(second.as_mut()).is_ready());
+    }
+
+    #[test]
+    fn acquiring_front_waiter_wakes_next_eligible_request() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{
+                    AtomicUsize,
+                    Ordering,
+                },
+            },
+            task::Wake,
+        };
+        struct Counter(AtomicUsize);
+        impl Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let semaphore = Semaphore::new(2);
+        let mut cx = Context::from_waker(Waker::noop());
+        let held = match Box::pin(semaphore.acquire_many(2)).as_mut().poll(&mut cx) {
+            | Poll::Ready(permit) => permit,
+            | _ => panic!("initial permits available"),
+        };
+        let mut first = Box::pin(semaphore.acquire());
+        let mut second = Box::pin(semaphore.acquire());
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut second_cx = Context::from_waker(&waker);
+        assert!(second.as_mut().poll(&mut second_cx).is_pending());
+        drop(held);
+        let first_permit = match first.as_mut().poll(&mut cx) {
+            | Poll::Ready(permit) => permit,
+            | _ => panic!("released permits available"),
+        };
+        assert_eq!(counter.0.load(Ordering::Relaxed), 1);
+        assert!(second.as_mut().poll(&mut second_cx).is_ready());
+        drop(first_permit);
     }
 }

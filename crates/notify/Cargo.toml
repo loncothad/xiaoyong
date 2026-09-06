@@ -1,7 +1,7 @@
 [package]
 name                 = "xiaoyong-notify"
 description          = "Thread-safe and single-threaded asynchronous notification primitives"
-version              = "2.0.0"
+version              = "2.0.1"
 publish.workspace    = true
 authors.workspace    = true
 repository.workspace = true

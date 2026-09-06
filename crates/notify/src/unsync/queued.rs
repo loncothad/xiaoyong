@@ -14,9 +14,10 @@ use std::{
 use smallvec::SmallVec;
 
 struct Waiter {
-    id:       usize,
-    notified: bool,
-    waker:    Option<Waker>,
+    id:           usize,
+    notified:     bool,
+    transferable: bool,
+    waker:        Option<Waker>,
 }
 
 #[derive(Default)]
@@ -53,6 +54,7 @@ impl Notify {
         let mut inner = self.inner.take();
         let waker = if let Some(waiter) = inner.waiters.iter_mut().find(|waiter| !waiter.notified) {
             waiter.notified = true;
+            waiter.transferable = true;
             waiter.waker.take()
         } else {
             inner.permits = inner.permits.saturating_add(1);
@@ -150,6 +152,7 @@ impl Future for NotifiedFuture {
         inner.waiters.push(Waiter {
             id,
             notified: false,
+            transferable: false,
             waker: Some(context.waker().clone()),
         });
         self.id = Some(id);
@@ -162,8 +165,15 @@ impl Drop for NotifiedFuture {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let mut inner = self.notify.inner.take();
-            inner.waiters.retain(|waiter| waiter.id != id);
+            let removed = inner
+                .waiters
+                .iter()
+                .position(|waiter| waiter.id == id)
+                .map(|index| inner.waiters.remove(index));
             self.notify.inner.set(inner);
+            if removed.as_ref().is_some_and(|waiter| waiter.transferable) {
+                self.notify.notify_one();
+            }
         }
     }
 }
@@ -209,5 +219,33 @@ mod tests {
 
         notify.notify_one();
         notify.notified().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_assigned_notification_is_transferred() {
+        let notify = Notify::new();
+        let mut first = Box::pin(notify.notified());
+        let mut second = Box::pin(notify.notified());
+        assert!(poll!(first.as_mut()).is_pending());
+        assert!(poll!(second.as_mut()).is_pending());
+        notify.notify_one();
+        drop(first);
+        assert!(poll!(second.as_mut()).is_ready());
+
+        let mut canceled = Box::pin(notify.notified());
+        assert!(poll!(canceled.as_mut()).is_pending());
+        notify.notify_one();
+        drop(canceled);
+        assert!(poll!(Box::pin(notify.notified())).is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_broadcast_does_not_create_a_permit() {
+        let notify = Notify::new();
+        let mut first = Box::pin(notify.notified());
+        assert!(poll!(first.as_mut()).is_pending());
+        notify.notify_waiters();
+        drop(first);
+        assert!(poll!(Box::pin(notify.notified())).is_pending());
     }
 }

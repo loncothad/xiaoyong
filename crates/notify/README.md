@@ -30,3 +30,8 @@ these types and passing them across threads would lead to undefined behavior
 
 - `unsync::semaphore::Semaphore`: A fair, cancellation-safe, single-threaded
   asynchronous semaphore for rate-limiting.
+
+Reusable notifications broadcast to existing wait futures and coalesce idle
+notifications into one stored permit. Canceling a queued `notify_one` recipient
+passes its notification to the next waiter (or stores it for a future waiter).
+Semaphore acquisitions wake the next eligible FIFO request when permits remain.
