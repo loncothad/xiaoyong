@@ -20,6 +20,8 @@ use core::{
 
 use smallvec::SmallVec;
 
+type Waiter = (usize, WaiterType, Option<Waker>);
+
 const UNLOCKED: usize = 0;
 const WRITE_LOCKED: usize = usize::MAX;
 
@@ -38,7 +40,7 @@ enum WaiterType {
 pub struct RwLock<T: ?Sized> {
     state:   Cell<usize>,
     next_id: Cell<usize>,
-    waiters: Cell<SmallVec<[(usize, WaiterType, Waker); 8]>>,
+    waiters: Cell<SmallVec<[Waiter; 8]>>,
     value:   UnsafeCell<T>,
 }
 
@@ -135,23 +137,24 @@ impl<T: ?Sized> RwLock<T> {
     /// Wakes the next eligible tasks. If a writer is first, wakes it.
     /// If a reader is first, wakes ALL contiguous readers at the front.
     fn wake_next(&self) {
-        let queue = self.waiters.take();
-
-        let wakers = match queue.first() {
+        let mut queue = self.waiters.take();
+        let mut wakers = SmallVec::<[Waker; 8]>::new();
+        match queue.first_mut() {
             | Some((_, WaiterType::Write, waker)) if self.state.get() == UNLOCKED => {
-                smallvec::smallvec![waker.clone()]
+                if let Some(waker) = waker.take() {
+                    wakers.push(waker);
+                }
             },
             | Some((_, WaiterType::Read, _)) if self.state.get() != WRITE_LOCKED => {
-                queue
-                    .iter()
-                    .take_while(|(_, kind, _)| *kind == WaiterType::Read)
-                    .map(|(_, _, waker)| waker.clone())
-                    .collect::<SmallVec<[Waker; 8]>>()
+                for (_, _, waker) in queue.iter_mut().take_while(|(_, kind, _)| *kind == WaiterType::Read) {
+                    if let Some(waker) = waker.take() {
+                        wakers.push(waker);
+                    }
+                }
             },
-            | _ => SmallVec::new(),
-        };
+            | _ => {},
+        }
         self.waiters.set(queue);
-        // Restore the queue before invoking user-provided wake callbacks.
         for waker in wakers {
             waker.wake();
         }
@@ -168,6 +171,8 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
     type Output = RwLockReadGuard<'a, T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cloning may run user code. Observe lock state only after it returns.
+        let waker = cx.waker().clone();
         let s = self.lock.state.get();
 
         let id = self.id.unwrap_or_else(|| {
@@ -188,26 +193,28 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
         if s != WRITE_LOCKED && !has_writer_ahead {
             assert!(s < WRITE_LOCKED - 1, "maximum number of readers exceeded");
             self.lock.state.set(s + 1);
-            queue.retain(|(i, ..)| *i != id);
+            let removed = queue
+                .iter()
+                .position(|(i, ..)| *i == id)
+                .map(|index| queue.remove(index));
             self.lock.waiters.set(queue);
             self.id = None;
+            drop(removed);
             return Poll::Ready(RwLockReadGuard {
                 lock: self.lock
             });
         }
 
-        match queue.iter_mut().find(|(i, ..)| *i == id) {
-            | Some(entry) => {
-                if !entry.2.will_wake(cx.waker()) {
-                    entry.2 = cx.waker().clone();
-                }
-            },
+        let old_waker = match queue.iter_mut().find(|(i, ..)| *i == id) {
+            | Some(entry) => entry.2.replace(waker),
             | None => {
-                queue.push((id, WaiterType::Read, cx.waker().clone()));
+                queue.push((id, WaiterType::Read, Some(waker)));
+                None
             },
-        }
+        };
 
         self.lock.waiters.set(queue);
+        drop(old_waker);
         Poll::Pending
     }
 }
@@ -217,8 +224,12 @@ impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
         if let Some(id) = self.id {
             let mut queue = self.lock.waiters.take();
             let was_first = queue.first().is_some_and(|(i, ..)| *i == id);
-            queue.retain(|(i, ..)| *i != id);
+            let removed = queue
+                .iter()
+                .position(|(i, ..)| *i == id)
+                .map(|index| queue.remove(index));
             self.lock.waiters.set(queue);
+            drop(removed);
 
             // Pass the baton if we were blocking a wakeup chain
             if was_first {
@@ -238,6 +249,8 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
     type Output = RwLockWriteGuard<'a, T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cloning may run user code. Observe lock state only after it returns.
+        let waker = cx.waker().clone();
         let s = self.lock.state.get();
 
         let id = self.id.unwrap_or_else(|| {
@@ -252,26 +265,28 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 
         if s == UNLOCKED && is_first {
             self.lock.state.set(WRITE_LOCKED);
-            queue.retain(|(i, ..)| *i != id);
+            let removed = queue
+                .iter()
+                .position(|(i, ..)| *i == id)
+                .map(|index| queue.remove(index));
             self.lock.waiters.set(queue);
             self.id = None;
+            drop(removed);
             return Poll::Ready(RwLockWriteGuard {
                 lock: self.lock
             });
         }
 
-        match queue.iter_mut().find(|(i, ..)| *i == id) {
-            | Some(entry) => {
-                if !entry.2.will_wake(cx.waker()) {
-                    entry.2 = cx.waker().clone();
-                }
-            },
+        let old_waker = match queue.iter_mut().find(|(i, ..)| *i == id) {
+            | Some(entry) => entry.2.replace(waker),
             | None => {
-                queue.push((id, WaiterType::Write, cx.waker().clone()));
+                queue.push((id, WaiterType::Write, Some(waker)));
+                None
             },
-        }
+        };
 
         self.lock.waiters.set(queue);
+        drop(old_waker);
         Poll::Pending
     }
 }
@@ -281,8 +296,12 @@ impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
         if let Some(id) = self.id {
             let mut queue = self.lock.waiters.take();
             let was_first = queue.first().is_some_and(|(i, ..)| *i == id);
-            queue.retain(|(i, ..)| *i != id);
+            let removed = queue
+                .iter()
+                .position(|(i, ..)| *i == id)
+                .map(|index| queue.remove(index));
             self.lock.waiters.set(queue);
+            drop(removed);
 
             if was_first {
                 self.lock.wake_next();
@@ -424,5 +443,73 @@ mod tests {
         let unsized_lock: &mut RwLock<[i32]> = &mut lock;
         unsized_lock.get_mut()[1] = 20;
         assert_eq!(lock.into_inner(), [1, 20, 3]);
+    }
+
+    #[test]
+    fn cancellation_preserves_waiters_registered_by_waker_drop() {
+        use std::{
+            cell::RefCell,
+            sync::Arc,
+            task::Wake,
+        };
+        thread_local! {
+            static ON_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+        struct Reenter;
+        impl Wake for Reenter {
+            fn wake(self: Arc<Self>) {
+                drop(self);
+            }
+        }
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                let callback = ON_DROP.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+        let lock = Rc::new(RwLock::new(0));
+        let held = lock.try_write().unwrap();
+        let waker = Waker::from(Arc::new(Reenter));
+        let mut canceled = Box::pin(lock.write());
+        assert!(canceled.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        drop(waker);
+        let mut second = Box::pin(lock.write());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        type Waiter = Pin<Box<dyn Future<Output = ()>>>;
+        let reentrant = Rc::new(RefCell::new(None::<Waiter>));
+        ON_DROP.with(|slot| {
+            let lock = Rc::clone(&lock);
+            let reentrant = Rc::clone(&reentrant);
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut future: Waiter = Box::pin(async move {
+                    drop(lock.write().await);
+                });
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                *reentrant.borrow_mut() = Some(future);
+            }));
+        });
+        drop(canceled);
+        let queue = lock.waiters.take();
+        assert_eq!(queue.len(), 2);
+        lock.waiters.set(queue);
+        drop(held);
+        assert!(second.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            reentrant
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(&mut cx)
+                .is_ready()
+        );
     }
 }

@@ -19,6 +19,8 @@ use core::{
 
 use smallvec::SmallVec;
 
+type Waiter = (usize, Option<Waker>);
+
 /// Asynchronous, single-threaded Mutex.
 ///
 /// **Thread Safety:** This Mutex is built on Cell and UnsafeCell and does not
@@ -27,7 +29,7 @@ use smallvec::SmallVec;
 pub struct Mutex<T: ?Sized> {
     is_locked: Cell<bool>,
     next_id:   Cell<usize>,
-    waiters:   Cell<SmallVec<[(usize, Waker); 8]>>,
+    waiters:   Cell<SmallVec<[Waiter; 8]>>,
     value:     UnsafeCell<T>,
 }
 
@@ -108,6 +110,8 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
     type Output = MutexGuard<'a, T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cloning may run user code. Observe lock state only after it returns.
+        let waker = cx.waker().clone();
         let mut queue = self.mutex.waiters.take();
         let is_next = match self.id {
             | Some(id) => queue.first().is_some_and(|(waiter_id, _)| *waiter_id == id),
@@ -118,13 +122,20 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
             self.mutex.is_locked.set(true);
 
             // Success: Clean up our queue entry if we were previously pending
-            if let Some(id) = self.id {
-                queue.retain(|(w_id, _)| *w_id != id);
+            let removed = if let Some(id) = self.id {
+                let removed = queue
+                    .iter()
+                    .position(|(w_id, _)| *w_id == id)
+                    .map(|index| queue.remove(index));
 
                 // Disable the Drop handler since we successfully acquired the lock
                 self.id = None;
-            }
+                removed
+            } else {
+                None
+            };
             self.mutex.waiters.set(queue);
+            drop(removed);
 
             Poll::Ready(MutexGuard {
                 mutex: self.mutex
@@ -139,18 +150,16 @@ impl<'a, T: ?Sized> Future for LockFuture<'a, T> {
             });
 
             // Update the waker if we're already in the queue, else push
-            match queue.iter_mut().find(|(i, _)| *i == id) {
-                | Some(entry) => {
-                    if !entry.1.will_wake(cx.waker()) {
-                        entry.1 = cx.waker().clone();
-                    }
-                },
+            let old_waker = match queue.iter_mut().find(|(i, _)| *i == id) {
+                | Some(entry) => entry.1.replace(waker),
                 | None => {
-                    queue.push((id, cx.waker().clone()));
+                    queue.push((id, Some(waker)));
+                    None
                 },
-            }
+            };
 
             self.mutex.waiters.set(queue);
+            drop(old_waker);
             Poll::Pending
         }
     }
@@ -162,14 +171,18 @@ impl<'a, T: ?Sized> Drop for LockFuture<'a, T> {
             let mut queue = self.mutex.waiters.take();
 
             // Remove this specific future from the wait queue
-            queue.retain(|(w_id, _)| *w_id != id);
+            let removed = queue
+                .iter()
+                .position(|(w_id, _)| *w_id == id)
+                .map(|index| queue.remove(index));
 
             let next_waker = if !self.mutex.is_locked.get() {
-                queue.first().map(|(_, waker)| waker.clone())
+                queue.first_mut().and_then(|(_, waker)| waker.take())
             } else {
                 None
             };
             self.mutex.waiters.set(queue);
+            drop(removed);
             if let Some(waker) = next_waker {
                 waker.wake();
             }
@@ -202,8 +215,8 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
     fn drop(&mut self) {
         self.mutex.is_locked.set(false);
 
-        let queue = self.mutex.waiters.take();
-        let next_waker = queue.first().map(|(_, waker)| waker.clone());
+        let mut queue = self.mutex.waiters.take();
+        let next_waker = queue.first_mut().and_then(|(_, waker)| waker.take());
         self.mutex.waiters.set(queue);
 
         if let Some(waker) = next_waker {
@@ -266,5 +279,73 @@ mod tests {
         let unsized_lock: &mut Mutex<[i32]> = &mut lock;
         unsized_lock.get_mut()[1] = 20;
         assert_eq!(lock.into_inner(), [1, 20, 3]);
+    }
+
+    #[test]
+    fn cancellation_preserves_waiters_registered_by_waker_drop() {
+        use std::{
+            cell::RefCell,
+            sync::Arc,
+            task::Wake,
+        };
+        thread_local! {
+            static ON_DROP: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+        struct Reenter;
+        impl Wake for Reenter {
+            fn wake(self: Arc<Self>) {
+                drop(self);
+            }
+        }
+        impl Drop for Reenter {
+            fn drop(&mut self) {
+                let callback = ON_DROP.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+        }
+        let lock = Rc::new(Mutex::new(0));
+        let held = lock.try_lock().unwrap();
+        let waker = Waker::from(Arc::new(Reenter));
+        let mut canceled = Box::pin(lock.lock());
+        assert!(canceled.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        drop(waker);
+        let mut second = Box::pin(lock.lock());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        type Waiter = Pin<Box<dyn Future<Output = ()>>>;
+        let reentrant = Rc::new(RefCell::new(None::<Waiter>));
+        ON_DROP.with(|slot| {
+            let lock = Rc::clone(&lock);
+            let reentrant = Rc::clone(&reentrant);
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut future: Waiter = Box::pin(async move {
+                    drop(lock.lock().await);
+                });
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                *reentrant.borrow_mut() = Some(future);
+            }));
+        });
+        drop(canceled);
+        let queue = lock.waiters.take();
+        assert_eq!(queue.len(), 2);
+        lock.waiters.set(queue);
+        drop(held);
+        assert!(second.as_mut().poll(&mut cx).is_ready());
+        assert!(
+            reentrant
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(&mut cx)
+                .is_ready()
+        );
     }
 }

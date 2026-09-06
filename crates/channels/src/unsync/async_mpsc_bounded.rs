@@ -122,15 +122,13 @@ impl<T> Sender<T> {
         let mut val_opt = Some(value);
         let mut registration = SenderRegistration::new(&self.shared);
         poll_fn(|cx| {
+            registration.register(cx.waker());
             let v = val_opt.take().unwrap();
             match self.try_push(v) {
                 | Ok(()) => Poll::Ready(Ok(())),
                 | Err(TryPushError::Closed(v)) => Poll::Ready(Err(PushError(v))),
                 | Err(TryPushError::Full(v)) => {
                     val_opt = Some(v); // Put the value back for the next poll
-
-                    // Register the sender's waker to be notified on the next pop
-                    registration.register(cx.waker());
 
                     Poll::Pending
                 },
@@ -175,12 +173,12 @@ impl<T> Sender<T> {
 
         let mut registration = SenderRegistration::new(&self.shared);
         poll_fn(|cx| {
+            registration.register(cx.waker());
             match self.try_push_many(std::mem::take(&mut remainder)) {
                 | Ok(()) => Poll::Ready(Ok(())),
                 | Err(TryPushManyError::Closed(rem)) => Poll::Ready(Err(PushManyError(rem))),
                 | Err(TryPushManyError::Full(rem)) => {
                     remainder = rem;
-                    registration.register(cx.waker());
                     Poll::Pending
                 },
             }
@@ -203,6 +201,7 @@ impl<'a, T> SenderRegistration<'a, T> {
     }
 
     fn register(&mut self, waker: &Waker) {
+        let waker = waker.clone();
         let mut waiters = self.shared.tx_wakers.take();
         let id = match self.id {
             | Some(id) => id,
@@ -213,14 +212,14 @@ impl<'a, T> SenderRegistration<'a, T> {
                 id
             },
         };
-        if let Some((_, registered)) = waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
-            if !registered.will_wake(waker) {
-                *registered = waker.clone();
-            }
+        let old_waker = if let Some((_, registered)) = waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
+            Some(std::mem::replace(registered, waker))
         } else {
-            waiters.push((id, waker.clone()));
-        }
+            waiters.push((id, waker));
+            None
+        };
         self.shared.tx_wakers.set(waiters);
+        drop(old_waker);
     }
 }
 
@@ -228,8 +227,12 @@ impl<T> Drop for SenderRegistration<'_, T> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
             let mut waiters = self.shared.tx_wakers.take();
-            waiters.retain(|(waiter_id, _)| *waiter_id != id);
+            let removed = waiters
+                .iter()
+                .position(|(waiter_id, _)| *waiter_id == id)
+                .map(|index| waiters.remove(index));
             self.shared.tx_wakers.set(waiters);
+            drop(removed);
         }
     }
 }
@@ -280,13 +283,11 @@ impl<T> Receiver<T> {
     /// Pop a value from the channel.
     pub async fn pop(&mut self) -> Option<T> {
         poll_fn(|cx| {
+            self.shared.rx_waker.set(Some(cx.waker().clone()));
             match self.try_pop() {
                 | Ok(value) => Poll::Ready(Some(value)),
                 | Err(TryPopError::Closed) => Poll::Ready(None),
-                | Err(TryPopError::Empty) => {
-                    self.shared.rx_waker.set(Some(cx.waker().clone()));
-                    Poll::Pending
-                },
+                | Err(TryPopError::Empty) => Poll::Pending,
             }
         })
         .await
@@ -330,13 +331,11 @@ impl<T> Receiver<T> {
         }
 
         poll_fn(|cx| {
+            self.shared.rx_waker.set(Some(cx.waker().clone()));
             match self.try_pop_many(limit) {
                 | Ok(values) => Poll::Ready(values),
                 | Err(TryPopError::Closed) => Poll::Ready(Vec::new()),
-                | Err(TryPopError::Empty) => {
-                    self.shared.rx_waker.set(Some(cx.waker().clone()));
-                    Poll::Pending
-                },
+                | Err(TryPopError::Empty) => Poll::Pending,
             }
         })
         .await
@@ -466,5 +465,45 @@ mod tests {
         });
         tx.try_push_many(values).unwrap();
         assert_eq!(rx.try_pop_many(3), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn send_during_receiver_waker_clone_is_observed() {
+        use std::{
+            cell::RefCell,
+            pin::Pin,
+            task::{
+                Context,
+                RawWaker,
+                RawWakerVTable,
+            },
+        };
+        thread_local! {
+            static ON_CLONE: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        }
+        fn raw_waker() -> RawWaker {
+            fn clone(_: *const ()) -> RawWaker {
+                let callback = ON_CLONE.with(|slot| slot.borrow_mut().take());
+                if let Some(callback) = callback {
+                    callback();
+                }
+                raw_waker()
+            }
+            fn noop(_: *const ()) {}
+            static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        let (tx, mut rx) = channel(1);
+        ON_CLONE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                tx.try_push(42).unwrap();
+            }))
+        });
+        // SAFETY: the static vtable does not dereference its null data or own
+        // resources, and callbacks are accessed only in thread-local storage.
+        let waker = unsafe { Waker::from_raw(raw_waker()) };
+        let mut future = Box::pin(rx.pop());
+        let mut cx = Context::from_waker(&waker);
+        assert_eq!(Pin::new(&mut future).poll(&mut cx), Poll::Ready(Some(42)));
     }
 }
