@@ -7,7 +7,7 @@ publish = true
 authors = [ "loncothad <me@loncothad.cc>" ]
 repository = "https://github.com/loncothad/xiaoyong"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

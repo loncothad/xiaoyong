@@ -14,7 +14,21 @@ and has its own README with API and usage details.
 - [`xiaoyong-collections`](crates/collections): allocation-free fixed-capacity
   collections.
 
-The workspace's minimum supported Rust version is 1.85.
+The workspace's minimum supported Rust version is 1.100. Until Rust 1.100 is
+released, development requires the beta toolchain selected by
+[`rust-toolchain.toml`](rust-toolchain.toml). After release, change its channel
+from `beta` to `1.100.0`.
+
+## Development
+
+Run `just check` to check, test, lint, and build documentation for the workspace,
+including the optional `arc-swap` feature. These commands use the repository's
+selected toolchain.
+
+`just fmt` also requires Taplo, rumdl, and a separately installed nightly
+toolchain (`rustup toolchain install nightly --profile minimal --component rustfmt`).
+Only formatting uses nightly, because the existing `.rustfmt.toml` configuration
+uses nightly-only options; building and testing do not require nightly.
 
 ## License
 

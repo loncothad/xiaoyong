@@ -5,8 +5,8 @@ fmt:
     rumdl check --fix .
 
 check:
-    cargo +nightly check --workspace
-    cargo +nightly check -p xiaoyong-value --features arc-swap
-    cargo +nightly test --workspace --all-features
-    cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
-    RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --all-features --no-deps
+    cargo check --workspace
+    cargo check -p xiaoyong-value --features arc-swap
+    cargo test --workspace --all-features
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
