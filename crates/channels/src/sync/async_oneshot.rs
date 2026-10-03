@@ -98,14 +98,13 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            if inner
+        if let Some(inner) = self.inner.take()
+            && inner
                 .state
                 .compare_exchange(INCOMPLETE, TX_DROPPED, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
-            {
-                inner.waker.wake();
-            }
+        {
+            inner.waker.wake();
         }
     }
 }

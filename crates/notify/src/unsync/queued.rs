@@ -119,31 +119,31 @@ impl Future for NotifiedFuture {
         let waker = context.waker().clone();
         let notify = Rc::clone(&self.notify);
         let mut inner = notify.inner.borrow_mut();
-        if let Some(id) = self.id {
-            if let Some(index) = inner.waiters.iter().position(|waiter| waiter.id == id) {
-                if inner.waiters[index].notified {
-                    let removed = inner.waiters.remove(index);
-                    self.id = None;
-                    self.completed = true;
-                    drop(inner);
-                    drop(removed);
-                    return Poll::Ready(());
-                }
-
-                let waiter = &mut inner.waiters[index];
-                if waiter
-                    .waker
-                    .as_ref()
-                    .is_none_or(|waker| !waker.will_wake(context.waker()))
-                {
-                    let old = waiter.waker.replace(waker);
-                    drop(inner);
-                    drop(old);
-                } else {
-                    drop(inner);
-                }
-                return Poll::Pending;
+        if let Some(id) = self.id
+            && let Some(index) = inner.waiters.iter().position(|waiter| waiter.id == id)
+        {
+            if inner.waiters[index].notified {
+                let removed = inner.waiters.remove(index);
+                self.id = None;
+                self.completed = true;
+                drop(inner);
+                drop(removed);
+                return Poll::Ready(());
             }
+
+            let waiter = &mut inner.waiters[index];
+            if waiter
+                .waker
+                .as_ref()
+                .is_none_or(|waker| !waker.will_wake(context.waker()))
+            {
+                let old = waiter.waker.replace(waker);
+                drop(inner);
+                drop(old);
+            } else {
+                drop(inner);
+            }
+            return Poll::Pending;
         }
 
         if inner.permits > 0 {

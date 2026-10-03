@@ -14,16 +14,15 @@ and has its own README with API and usage details.
 - [`xiaoyong-collections`](crates/collections): allocation-free fixed-capacity
   collections.
 
-The workspace's minimum supported Rust version is 1.100. Until Rust 1.100 is
-released, development requires the beta toolchain selected by
-[`rust-toolchain.toml`](rust-toolchain.toml). After release, change its channel
-from `beta` to `1.100.0`.
+The workspace's minimum supported Rust version is 1.100, targeting the stable
+release. No toolchain channel is pinned; Rust 1.100 beta has been used for local
+validation ahead of the stable release.
 
 ## Development
 
 Run `just check` to check, test, lint, and build documentation for the workspace,
-including the optional `arc-swap` feature. These commands use the repository's
-selected toolchain.
+including the optional `arc-swap` feature. These commands use ordinary Cargo
+with your selected toolchain.
 
 `just fmt` also requires Taplo, rumdl, and a separately installed nightly
 toolchain (`rustup toolchain install nightly --profile minimal --component rustfmt`).

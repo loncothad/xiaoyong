@@ -251,10 +251,10 @@ impl<T> Drop for Sender<T> {
         let count = self.shared.sender_count.get() - 1;
         self.shared.sender_count.set(count);
 
-        if count == 0 {
-            if let Some(waker) = self.shared.rx_waker.take() {
-                waker.wake();
-            }
+        if count == 0
+            && let Some(waker) = self.shared.rx_waker.take()
+        {
+            waker.wake();
         }
     }
 }

@@ -105,17 +105,17 @@ impl<'a> Future for WaitFuture<'a> {
 
 impl<'a> Drop for WaitFuture<'a> {
     fn drop(&mut self) {
-        if let Some(idx) = self.index {
-            if !self.notify.fired.load(Ordering::Acquire) {
-                let mut waiters = self
-                    .notify
-                    .waiters
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let old_waker = waiters.get_mut(idx).and_then(Option::take);
-                drop(waiters);
-                drop(old_waker);
-            }
+        if let Some(idx) = self.index
+            && !self.notify.fired.load(Ordering::Acquire)
+        {
+            let mut waiters = self
+                .notify
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let old_waker = waiters.get_mut(idx).and_then(Option::take);
+            drop(waiters);
+            drop(old_waker);
         }
     }
 }
